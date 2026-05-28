@@ -13,7 +13,20 @@ import {
 
 function getDomain(value) {
   const domain = String(value || "").trim().toLowerCase();
-  return domain === "education" || domain === "religious" ? domain : "";
+  // Accept all valid domain names
+  const validDomains = [
+    "education",
+    "religious",
+    "design-thinking",
+    "digital-literacy",
+    "emotional-intelligence",
+    "entrepreneurship",
+    "financial-literacy",
+    "global-citizenship",
+    "sustainability",
+    "wellbeing"
+  ];
+  return validDomains.includes(domain) ? domain : "";
 }
 
 /**
@@ -199,8 +212,8 @@ export async function POST(request) {
       );
     }
 
-    // Domain guardrails (prevents streaming a disallowed answer).
-    if (domain) {
+    // Domain guardrails (only for religious and education domains).
+    if (domain === "religious" || domain === "education") {
       const allowed =
         domain === "religious"
           ? isReligiousTopicAllowedByIntent(transcriptText)

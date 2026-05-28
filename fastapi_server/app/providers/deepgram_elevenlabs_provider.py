@@ -95,7 +95,8 @@ class DeepgramElevenLabsProvider(SpeechProvider):
 
         # Map language codes to the best Deepgram model that supports them.
         # Nova-3 supports Indian regional languages (ta, te, kn, ml, bn, mr, gu, pa)
-        # added in Jan 2026. Nova-2 handles English, Hindi, and major world languages.
+        # added in Jan 2026. Nova-2 handles English, Hindi, and major world languages
+        # including Chinese (zh, zh-CN, zh-TW) and Japanese (ja).
         _NOVA3_LANGUAGES = {"ta", "te", "kn", "ml", "bn", "mr", "gu", "pa", "tl", "be", "bs", "hr", "mk", "sr", "sl"}
 
         # For Hinglish (hi-Latn), use Hindi model
@@ -103,6 +104,8 @@ class DeepgramElevenLabsProvider(SpeechProvider):
         # Strip region suffix for lookup (e.g. "en-US" -> "en")
         lang_base = deepgram_lang.split("-")[0].lower()
 
+        # Use nova-3 for regional Indian languages, nova-2 for everything else
+        # (nova-2 supports zh, ja, ar, ko, and all major languages)
         deepgram_model = "nova-3" if lang_base in _NOVA3_LANGUAGES else config.DEEPGRAM_MODEL
 
         params = {

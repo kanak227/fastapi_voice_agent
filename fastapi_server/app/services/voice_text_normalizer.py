@@ -159,15 +159,21 @@ class VoiceTextNormalizer:
         result = _MULTI_SPACE_RE.sub(" ", result)
 
         # 7. Clean up punctuation artifacts
-        # Remove double periods, trailing commas before periods, etc.
+        # Remove double periods, but preserve exclamation marks and question marks
         result = re.sub(r"\.{2,}", ".", result)
         result = re.sub(r",\s*\.", ".", result)
         result = re.sub(r"\.\s*,", ".", result)
         result = re.sub(r"^\s*[.,;:]\s*", "", result)
         # Strip orphan punctuation left by emoji/markdown removal:
         # double spaces, " . " in the middle of text, " , ," etc.
-        result = re.sub(r"\s+([,.!?;:])", r"\1", result)
-        result = re.sub(r"([,.!?;:])\s*([,.!?;:])", r"\1", result)
+        # But preserve ! and ? for natural speech intonation
+        result = re.sub(r"\s+([,.;:])", r"\1", result)
+        result = re.sub(r"([,.;:])\s*([,.;:])", r"\1", result)
+        # Normalize multiple exclamation/question marks to single ones
+        result = re.sub(r"!{2,}", "!", result)
+        result = re.sub(r"\?{2,}", "?", result)
+        # Add slight pause after exclamation/question marks if followed by text
+        result = re.sub(r"([!?])([A-Za-z])", r"\1 \2", result)
         result = _MULTI_SPACE_RE.sub(" ", result)
 
         return result.strip()
