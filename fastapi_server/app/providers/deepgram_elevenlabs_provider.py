@@ -184,6 +184,9 @@ class DeepgramElevenLabsProvider(SpeechProvider):
             raise DeepgramElevenLabsError("ELEVENLABS_API_KEY is not set")
 
         url = f"{config.ELEVENLABS_BASE_URL.rstrip('/')}/voices"
+        # Pass language filter to backend if provided
+        if language:
+            url = f"{url}?language={language}"
 
         async with httpx.AsyncClient(timeout=12.0) as client:
             resp = await client.get(url, headers={"xi-api-key": config.ELEVENLABS_API_KEY})
@@ -209,6 +212,10 @@ class DeepgramElevenLabsProvider(SpeechProvider):
             labels = item.get("labels") if isinstance(item.get("labels"), dict) else {}
             accent = labels.get("accent") if isinstance(labels, dict) else None
             locale = accent if isinstance(accent, str) and accent.strip() else None
+            
+            # Get supported languages from the voice item if available
+            languages = item.get("languages", [])
+            
             voices.append(
                 {
                     "name": item.get("name") or item.get("voice_id"),
@@ -216,17 +223,30 @@ class DeepgramElevenLabsProvider(SpeechProvider):
                     "locale": locale,
                     "gender": labels.get("gender") if isinstance(labels, dict) else None,
                     "provider": "elevenlabs",
+                    "languages": languages,
                 }
             )
 
         filtered_voices = [v for v in voices if v.get("name")]
         
-        # Filter by language if provided
+        # Additional client-side filtering by language if provided
+        # This handles cases where the backend doesn't filter or returns all voices
         if language:
             lang_base = language.split("-")[0].lower()
+            # Filter by either locale match or languages array match
             filtered_voices = [
                 v for v in filtered_voices
-                if v.get("locale") and v["locale"].split("-")[0].lower() == lang_base
+                if (
+                    # Match by locale field
+                    (v.get("locale") and v["locale"].split("-")[0].lower() == lang_base)
+                    # OR match by languages array
+                    or (v.get("languages") and any(
+                        lang.split("-")[0].lower() == lang_base 
+                        for lang in v["languages"]
+                    ))
+                    # OR if no locale/languages info, include it (backward compatibility)
+                    or (not v.get("locale") and not v.get("languages"))
+                )
             ]
         
         return filtered_voices
@@ -236,6 +256,10 @@ class DeepgramElevenLabsProvider(SpeechProvider):
         if not config.QWEN_TTS_BASE_URL:
             return []
         url = f"{config.QWEN_TTS_BASE_URL.rstrip('/')}/voices"
+        # Pass language filter to backend if provided
+        if language:
+            url = f"{url}?language={language}"
+        
         headers: dict[str, str] = {}
         if config.QWEN_TTS_API_KEY:
             headers["xi-api-key"] = config.QWEN_TTS_API_KEY
@@ -258,22 +282,39 @@ class DeepgramElevenLabsProvider(SpeechProvider):
             if not isinstance(item, dict):
                 continue
             labels = item.get("labels") if isinstance(item.get("labels"), dict) else {}
+            
+            # Get supported languages from the voice item if available
+            languages = item.get("languages", [])
+            
             out.append({
                 "name": item.get("name") or item.get("voice_id"),
                 "voice_id": item.get("voice_id"),
                 "locale": labels.get("accent") if isinstance(labels, dict) else None,
                 "gender": labels.get("gender") if isinstance(labels, dict) else None,
                 "provider": "qwen",
+                "languages": languages,
             })
         
         filtered_out = [v for v in out if v.get("voice_id")]
         
-        # Filter by language if provided
+        # Additional client-side filtering by language if provided
+        # This handles cases where the backend doesn't filter or returns all voices
         if language:
             lang_base = language.split("-")[0].lower()
+            # Filter by either locale match or languages array match
             filtered_out = [
                 v for v in filtered_out
-                if v.get("locale") and v["locale"].split("-")[0].lower() == lang_base
+                if (
+                    # Match by locale field (for MMS voices with language-specific accents)
+                    (v.get("locale") and v["locale"].split("-")[0].lower() == lang_base)
+                    # OR match by languages array (for multi-language voices like Serena/Ethan)
+                    or (v.get("languages") and any(
+                        lang.split("-")[0].lower() == lang_base 
+                        for lang in v["languages"]
+                    ))
+                    # OR if no locale/languages info, include it (backward compatibility)
+                    or (not v.get("locale") and not v.get("languages"))
+                )
             ]
         
         return filtered_out
