@@ -46,9 +46,9 @@ export function useVoiceChat({ onTranscript, onAudioCaptured, onError, language 
 
   const sampleRateRef = useRef(16000);
 
-  const minSpeechMs = 350;
-  const trailingSilenceMs = 900;
-  const energyThreshold = 0.012;
+  const minSpeechMs = 400;
+  const trailingSilenceMs = 700;
+  const energyThreshold = 0.018;
 
   const reportError = useCallback(
     (msg) => {

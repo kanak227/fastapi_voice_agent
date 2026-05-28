@@ -1,9 +1,32 @@
 from __future__ import annotations
 
 import base64
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+class AgentDomainsResponse(BaseModel):
+    """Public list of accepted `domain` values for `/agent/stream`."""
+
+    domains: list[str]
+    count: int
+
+
+class AgentDomain(StrEnum):
+    """Unified chat domains (must match dashboard `domain` strings and DOMAIN_MAP / DOMAIN_MAP_JSON)."""
+
+    religious = "religious"
+    education = "education"
+    digital_literacy = "digital-literacy"
+    design_thinking = "design-thinking"
+    wellbeing = "wellbeing"
+    sustainability = "sustainability"
+    global_citizenship = "global-citizenship"
+    entrepreneurship = "entrepreneurship"
+    emotional_intelligence = "emotional-intelligence"
+    financial_literacy = "financial-literacy"
 
 
 class AgentAudioInput(BaseModel):
@@ -27,7 +50,7 @@ class AgentStreamRequest(BaseModel):
     input_type: Literal["text", "audio", "voice"] = "text"
     text: str | None = None
     audio: AgentAudioInput | None = None
-    domain: Literal["religious", "education"] | None = Field(
+    domain: AgentDomain | None = Field(
         default=None,
         description="Which agent to use; required when tenant id does not encode the domain.",
     )
@@ -36,6 +59,7 @@ class AgentStreamRequest(BaseModel):
         description="Skip turn detection for single direct HTTP audio uploads.",
     )
     language: str | None = "en-US"
+    history: list[dict[str, str]] | None = None
 
     provider: str | None = None
     llm_model: str | None = None
@@ -45,6 +69,10 @@ class AgentStreamRequest(BaseModel):
     access_level: str | None = None
 
     output_audio: bool = True
+    tts_provider: Literal["elevenlabs", "qwen"] | None = Field(
+        default=None,
+        description="Force a TTS backend. None = server default (ElevenLabs).",
+    )
     tts_voice: str | None = None
     tts_format: str | None = None
     tts_emotion: str | None = None

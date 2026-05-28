@@ -1,0 +1,49 @@
+# Cloud Build sends the entire build context to Docker — keep it small.
+
+# VCS
+.git
+.gitignore
+
+# .env files NEVER belong in container images — secrets come from
+# Cloud Run's --set-secrets, and DOMAIN_MAP_JSON is set in code.
+**/.env
+**/.env.*
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/.venv/
+**/venv/
+**/.pytest_cache/
+
+# Node / Next.js (frontend uses its own .dockerignore inside the UI dir)
+**/node_modules/
+**/.next/
+**/.next-cache/
+**/dist/
+**/build/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+**/*.log
+
+# Salesforce + Kiro tooling not needed inside containers
+.sfdx/
+.kiro/
+storage/
+
+# Local dev junk
+*.bat
+*.ps1
+**/*.wav
+**/*.mp3
+
+# Things that belong only in the GPU TTS image, not the merged backend
+tts-qwen3/
+
+# Tests
+**/tests/
+**/test_*.py
+**/*_test.py

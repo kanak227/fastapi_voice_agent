@@ -36,9 +36,6 @@ class LLMHandler:
             normalized_provider,
             llm_model=llm_model,
         )
-        # DEBUG: Print provider, model, and Gemini API key
-        import os
-        print(f"[LLM DEBUG] Provider: {provider_name}, Model: {model_name}, GEMINI_API_KEY: {os.getenv('GEMINI_API_KEY')}")
         return model_selector.select(provider_name, model_name)
 
     async def generate_response(

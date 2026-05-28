@@ -1,243 +1,318 @@
 import os
-from dotenv import load_dotenv
+from collections.abc import AsyncIterator
+from typing import Any
 
-from langchain.prompts import PromptTemplate
-from langchain_core.runnables.base import RunnableSequence
-from langchain.output_parsers import PydanticOutputParser
-from langchain.schema import BasePromptTemplate
-from datetime import datetime
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
-from pathlib import Path
-import os, yaml, re, random
-from utils.common import DHOME
-from utils import common
 
-def _load_env():
-    # Ensure env is loaded reliably regardless of current working directory.
-    base_dir = Path(__file__).resolve().parents[1]
-    env_local_path = base_dir / ".env.local"
-    env_path = base_dir / ".env"
-
-    # Load base env first (should not override OS env)
-    load_dotenv(dotenv_path=env_path, override=False)
-
-    # Then apply local overrides (should override values from .env)
-    if env_local_path.exists():
-        load_dotenv(dotenv_path=env_local_path, override=True)
+from retrieval.mock_db import retrieve_documents
+from utils.common import gemini_model_for_chat
+from utils.state import BotState
 
 
-# load variables from dotenv file
-_load_env()
+class ScopeCheck(BaseModel):
+    is_in_scope: bool
 
-class LLMEngine:
-    def __init__(self, model_name: str, temperature: float = 0, max_tokens: int = 500):
-        _load_env()
-        
-        self.provider = os.getenv("LLM_PROVIDER", "gemini").lower()
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.model_name = model_name or self.get_default_model_name()
-        self.api_key = self.get_api_key()
-        
-        self.llm = None
-        self.prompt = None
-        self.parser = None
-        self.chain = None
-        
-        self.initialize_llm()
-        
-    def get_default_model_name(self) -> str:
-        if self.provider == "openai":
-            # Default to a commonly available model; allow override via env.
-            return os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-        if self.provider == "gemini":
-            # Gemini API expects model ids like "models/gemini-2.0-flash".
-            return os.getenv("GEMINI_MODEL") or "models/gemini-2.0-flash"
 
-        return os.getenv("LLM_MODEL") or "gpt-4o-mini"
+class HallucinationCheck(BaseModel):
+    has_hallucination: bool
+
+
+def _get_llm():
+    provider = (os.getenv("LLM_PROVIDER") or "gemini").strip().lower()
     
-    def get_api_key(self) -> str:
-        return {
-            "gemini": os.getenv("GOOGLE_API_KEY"),
-            "openai": os.getenv("OPENAI_API_KEY"),
-        }.get(self.provider, "")
-        
-    def initialize_llm(self):
-        if self.provider not in {"openai", "gemini"}:
-            raise ValueError(
-                f"Unsupported LLM provider: {self.provider}. "
-                "This service supports only 'openai' and 'gemini'."
-            )
-
-        if not self.api_key:
-            raise ValueError(
-                f"Missing API key for LLM provider '{self.provider}'. "
-                "Set the matching environment variable (e.g., GOOGLE_API_KEY / OPENAI_API_KEY)."
-            )
-        if self.provider == "gemini":
-            try:
-                from langchain_google_genai import ChatGoogleGenerativeAI
-            except ImportError as e:
-                raise ImportError(
-                    "Missing dependency for Gemini provider. Install 'langchain-google-genai'."
-                ) from e
-            self.llm = ChatGoogleGenerativeAI(
-                model = self.model_name,
-                temperature = self.temperature,
-                google_api_key = self.api_key,
-                max_tokens = self.max_tokens
-            )
-        elif self.provider == "openai":
-            try:
-                from langchain_openai import ChatOpenAI
-            except ImportError as e:
-                raise ImportError(
-                    "Missing dependency for OpenAI provider. Install 'langchain-openai'."
-                ) from e
-            self.llm = ChatOpenAI (
-                model = self.model_name,
-                temperature = self.temperature,
-                openai_api_key = self.api_key,
-                max_tokens = self.max_tokens
-            )
-        else:
-            raise ValueError(f"Unsupported LLM provider: {self.provider}")
-        
-        
-# Universally applicable
-    def load_prompt(self, prompt_path: Path) -> BasePromptTemplate:
-            """
-            Loads a custom prompt template from a YAML file.
-
-            :param prompt_path: The file path of the custom prompt template in YAML format.
-            """
-            prompt_data = {}
-            try:
-                with open(prompt_path, 'r') as file:
-                    prompt_data = yaml.safe_load(file)
-
-                # Extract the prompt content (Assuming the prompt YAML has a field 'template')
-                if 'template' not in prompt_data:
-                    raise ValueError("YAML file must contain a 'template' field.")
-            except FileNotFoundError:
-                    print(f"Error: The file at {prompt_path} was not found.")
-            except yaml.YAMLError as e:
-                print(f"Error parsing YAML file: {e}")
-            except Exception as e:
-                print(f"An error occurred while loading the prompt: {e}")
-
-            return PromptTemplate(
-                    input_variables=prompt_data['input_variables'],
-                    template=prompt_data['template']
-                )
-
-    def get_llm_sequence(self, prompt: BasePromptTemplate):
-        # Create the RunnableSequence
-        if not self.parser:
-            raise ValueError("Sequence could not be initialized. Please set the output parser and try again.")
-
-        self.chain = RunnableSequence(
-            prompt | self.llm | self.parser
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("Missing OPENAI_API_KEY. Set it as an environment variable.")
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        return ChatOpenAI(model=model, temperature=0, api_key=api_key)
+    else:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("Missing GOOGLE_API_KEY. Set it as an environment variable.")
+        return ChatGoogleGenerativeAI(
+            model=gemini_model_for_chat(),
+            temperature=0,
+            google_api_key=api_key,
         )
-        
-    def set_output_parser(self, parser: PydanticOutputParser):
-        self.parser = parser
-        
-    def respond(self, query: BaseModel) -> BaseModel:
-        """
-        Accepts a query, passes it through the chain, and returns the parsed response.
-
-        :param query: The user's input question.
-        :return: The parsed response as a QueryResponse object.
-        """
-        if self.chain is None:
-            raise ValueError("Sequence is not initialized. Please load the prompt and initialize the chain.")
-        
-        #random_number = random.randint(0, 0)
-        #self.api_key=GOOGLE_API_KEYS[random_number]
-        self.api_key = self.get_api_key()
-        self.initialize_llm()
-
-        prompt_inputs = query.dict()
-        prompt_inputs["format_instructions"] = self.parser.get_format_instructions()
-        
-        # Get the final prompt from the template by formatting it
-        prompt_text = self.prompt.format(**prompt_inputs)
-        prompt_text = self.clean_text_for_logging(prompt_text)
-        
-        # Log the final prompt
-        my_log = {"the_final_prompt": "", "resp": ""}
-        my_log["the_final_prompt"] = prompt_text
-        my_now = datetime.now()
-        folder_name = my_now.strftime("%d-%b-%Y")
-        formatted_date = my_now.strftime("%d-%b-%Y--%H-%M-%S-%f")
-        log_folder = os.path.join(common.LOGS, "llms", folder_name)
-
-        if not os.path.exists(log_folder):
-            os.makedirs(log_folder)
-        pfn = os.path.join(log_folder, "scan_" + formatted_date + ".json")
-        
-        # Run the chain with the input query and return the parsed output.
-        # If the model returns non-JSON text, fall back to a best-effort
-        # conversion instead of failing the request with parser exceptions.
-        query = dict(query)
-        query["format_instructions"] = self.parser.get_format_instructions()
-        try:
-            response = self.chain.invoke(query)
-        except Exception:
-            raw_prompt = self.prompt.format(**prompt_inputs)
-            raw_result = self.llm.invoke(raw_prompt)
-            raw_text = getattr(raw_result, "content", str(raw_result))
-            if not isinstance(raw_text, str):
-                raw_text = str(raw_text)
-
-            model_cls = getattr(self.parser, "pydantic_object", None)
-            if model_cls is None or not hasattr(model_cls, "model_fields"):
-                raise
-
-            fields = model_cls.model_fields
-            if model_cls.__name__ == "GuardrailsOutput":
-                normalized = raw_text.strip().upper()
-                output_value = "YES" if normalized.startswith("YES") else "NO"
-                response = model_cls(output=output_value, reason=raw_text)
-            else:
-                payload = {}
-                if "output" in fields:
-                    payload["output"] = raw_text
-                if "reason" in fields:
-                    payload["reason"] = "NA"
-                response = model_cls(**payload)
-
-        my_log["resp"] = str(response)
-        
-        common.write_to_json_file(pfn, my_log)
-        return response
-
-    def clean_text_for_logging(self, text):
-        """
-        Cleans up special characters, newlines, and Unicode escape sequences from the text.
-        
-        :param text: The text to clean.
-        :return: Cleaned text ready for logging.
-        """
-        # Replace \n with actual newlines for readability
-        cleaned_text = text.replace("\\n", "\n")
-        
-        # Optionally remove or handle other special characters (e.g., \uf076)
-        cleaned_text = re.sub(r"\\u[0-9A-Fa-f]{4}", "", cleaned_text)  # Remove Unicode escape sequences like \uf076
-        
-        return cleaned_text
 
 
-def get_llm_engine() -> LLMEngine:
 
-    _load_env()
-    
-    llm_engine = LLMEngine(
-        model_name="",
-        temperature=0.0,
-        max_tokens = 500
+
+def _format_history(history: list[dict[str, Any]]) -> str:
+    if not history:
+        return "No prior conversation."
+    lines = []
+    for msg in history[-6:]:
+        role = "User" if msg.get("role") == "user" else "SmartE"
+        content = msg.get("content", "").strip()
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def _draft_prompt(state: BotState) -> str:
+    docs = state['retrieved_docs']
+    history_str = _format_history(state.get('history', []))
+    _LANG_NAMES = {
+        "en-US": "English", "en": "English",
+        "hi": "Hindi", "hi-Latn": "Hinglish (Hindi written in Roman/Latin script, mixing Hindi and English naturally)",
+        "ta": "Tamil", "te": "Telugu", "mr": "Marathi", "bn": "Bengali",
+        "gu": "Gujarati", "kn": "Kannada", "ml": "Malayalam", "pa": "Punjabi",
+        "fr": "French", "de": "German", "es": "Spanish",
+        "ar": "Arabic", "zh": "Chinese", "ja": "Japanese",
+    }
+    lang_code = (state.get("response_language") or "en-US").strip()
+    lang_name = _LANG_NAMES.get(lang_code, lang_code)
+    is_english = lang_code in ("en-US", "en")
+    lang_prefix = "" if is_english else (
+        f"CRITICAL INSTRUCTION: You MUST respond ONLY in {lang_name}. "
+        f"Do NOT use English in your response. Every word must be in {lang_name}. "
+        f"Even if the question is asked in English, your answer must be entirely in {lang_name}.\n\n"
     )
-    return llm_engine
+    lang_instruction = "" if is_english else f"- CRITICAL: Respond ONLY in {lang_name}. Every word must be in {lang_name}, no English allowed.\n"
+    if docs and "The core principles of" not in docs and "No matching passages" not in docs:
+        return (
+            f"{lang_prefix}"
+            "You are a helpful assistant answering using the provided documents.\n"
+            f"Documents:\n{docs}\n\n"
+            f"Conversation History:\n{history_str}\n\n"
+            f"Query: {state['original_query']}\n"
+            "\n\nResponse Style Instructions:\n"
+        f"{lang_instruction}"
+        "- Use relevant emojis naturally throughout your response to make it engaging (e.g., 🌟, 💡, ✅, 📌, 🎯, 💪, 🧠, ❤️, 🌱, 📚, 🔑, ⭐, 🙌, ✨)\n- Use **bold** for key terms and important concepts\n- Use bullet points or numbered lists when listing multiple items\n- Use headings (## or ###) to organize longer responses into clear sections\n- Keep paragraphs short and scannable (2-3 sentences max)\n- Be warm, encouraging, and conversational in tone\n- Start with a brief engaging intro before diving into details\n- End with an encouraging closing thought or a follow-up question\n"
+        "- Do NOT greet with 'Namaste', 'Hello', or any greeting unless the user explicitly greeted you first in this message. Jump straight into the answer.\n"
+        "- IMPORTANT: If the query is unclear, misspelled, or you don't recognize a term, simply ask for clarification in 1-2 short sentences. Do NOT guess what the user meant, do NOT suggest unrelated topics, and do NOT list popular topics as filler.\n\n"
+            "Answer:"
+        )
+    else:
+        return (
+            f"{lang_prefix}"
+            "You are SmartE, a CBSE education mentor. Answer the user's question about CBSE education.\n"
+            "Provide helpful, practical advice based on general CBSE education knowledge.\n"
+            f"Query: {state['original_query']}\n"
+            "\n\nResponse Style Instructions:\n"
+        f"{lang_instruction}"
+        "- Use relevant emojis naturally throughout your response to make it engaging (e.g., 🌟, 💡, ✅, 📌, 🎯, 💪, 🧠, ❤️, 🌱, 📚, 🔑, ⭐, 🙌, ✨)\n- Use **bold** for key terms and important concepts\n- Use bullet points or numbered lists when listing multiple items\n- Use headings (## or ###) to organize longer responses into clear sections\n- Keep paragraphs short and scannable (2-3 sentences max)\n- Be warm, encouraging, and conversational in tone\n- Start with a brief engaging intro before diving into details\n- End with an encouraging closing thought or a follow-up question\n"
+        "- Do NOT greet with 'Namaste', 'Hello', or any greeting unless the user explicitly greeted you first in this message. Jump straight into the answer.\n"
+        "- IMPORTANT: If the query is unclear, misspelled, or you don't recognize a term, simply ask for clarification in 1-2 short sentences. Do NOT guess what the user meant, do NOT suggest unrelated topics, and do NOT list popular topics as filler.\n\n"
+            "Answer:"
+        )
 
- 
+
+def _extract_text_content(message: Any) -> str:
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+            else:
+                text = getattr(block, "text", None)
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def check_input_scope(state: BotState) -> BotState:
+    scope_llm = _get_llm().with_structured_output(ScopeCheck)
+    history_str = _format_history(state.get('history', []))
+    prompt = (
+        "You are a multilingual domain classifier. The query may be in ANY language (Hindi, Tamil, Telugu, English, etc.). Evaluate the MEANING of the query, not the language it is written in.\nIMPORTANT: If the query is in a non-English language and you are unsure of its meaning, return is_in_scope=true (be permissive for non-English queries).\nGreetings and short follow-ups in any language are always IN SCOPE.\n\nYou are a domain classifier for CBSE education topics.\n"
+        "A query is IN SCOPE if it relates to:\n"
+        "- Class 9 and Class 10 CBSE syllabus topics\n- Science, Mathematics, Social Science, English\n- Study tips, exam preparation strategies\n- Concept explanations and problem solving\n"
+        "\nA query is OUT OF SCOPE if it relates to:\n"
+        "- Medical or legal advice\n- Content outside CBSE Class 9-10 curriculum\n- Academic dishonesty (writing full assignments)\n"
+        "\n"
+        f"Domain: {state['domain']}\n"
+        f"Conversation History:\n{history_str}\n\n"
+        f"Query: {state['original_query']}\n"
+        "Return is_in_scope true if the query is IN SCOPE, false if OUT OF SCOPE."
+    )
+    result = scope_llm.invoke(prompt)
+    state["is_in_scope"] = bool(result.is_in_scope)
+    return state
+
+
+def retrieve_context(state: BotState) -> BotState:
+    tenant = (state.get("tenant_id") or "").strip() or None
+    state["retrieved_docs"] = retrieve_documents(
+        state["domain"], state["original_query"], tenant_id=tenant
+    )
+    return state
+
+
+def generate_draft(state: BotState) -> BotState:
+    llm = _get_llm()
+    result = llm.invoke(_draft_prompt(state))
+    state["draft_response"] = _extract_text_content(result).strip()
+    return state
+
+
+def verify_output(state: BotState) -> BotState:
+    # Skip hallucination check when no documents are available
+    docs = state['retrieved_docs']
+    if not docs or "The core principles of" in docs or "No matching passages" in docs:
+        state["hallucination_detected"] = False
+        state["final_output"] = state["draft_response"]
+        return state
+    
+    verify_llm = _get_llm().with_structured_output(HallucinationCheck)
+    prompt = (
+        "Check whether the answer includes claims that are not supported by the documents. "
+        "Return has_hallucination true if unsupported content exists.\n"
+        f"Documents:\n{state['retrieved_docs']}\n\n"
+        f"Answer:\n{state['draft_response']}"
+    )
+    result = verify_llm.invoke(prompt)
+    state["hallucination_detected"] = bool(result.has_hallucination)
+    if state["hallucination_detected"]:
+        state["loop_count"] += 1
+    else:
+        state["final_output"] = state["draft_response"]
+    return state
+
+
+def polite_refusal(state: BotState) -> BotState:
+    state["final_output"] = f"Sorry, I can only help with {state['domain']} topics."
+    return state
+
+
+def _scope_router(state: BotState) -> str:
+    # For voice input, skip the secondary scope check since Guardrails already approved
+    if state.get("is_voice", False):
+        return "retrieve_context"
+    return "retrieve_context" if state["is_in_scope"] else "polite_refusal"
+
+
+def _verify_router(state: BotState) -> str:
+    if state["hallucination_detected"]:
+        return "generate_draft" if state["loop_count"] < 3 else "polite_refusal"
+    return "accept"
+
+
+_graph = StateGraph(BotState)
+_graph.add_node("check_input_scope", check_input_scope)
+_graph.add_node("retrieve_context", retrieve_context)
+_graph.add_node("generate_draft", generate_draft)
+_graph.add_node("verify_output", verify_output)
+_graph.add_node("polite_refusal", polite_refusal)
+_graph.add_edge(START, "check_input_scope")
+_graph.add_conditional_edges(
+    "check_input_scope",
+    _scope_router,
+    {"retrieve_context": "retrieve_context", "polite_refusal": "polite_refusal"},
+)
+_graph.add_edge("retrieve_context", "generate_draft")
+_graph.add_edge("generate_draft", "verify_output")
+_graph.add_conditional_edges(
+    "verify_output",
+    _verify_router,
+    {"generate_draft": "generate_draft", "polite_refusal": "polite_refusal", "accept": END},
+)
+_compiled_graph = _graph.compile()
+
+
+def run_bot(
+    query: str,
+    domain: str,
+    *,
+    request_id: str = "",
+    tenant_id: str = "",
+    history: list[dict[str, Any]] = None,
+    is_voice: bool = False,
+    response_language: str = "en-US",
+) -> str:
+    state: BotState = {
+        "original_query": query,
+        "history": history or [],
+        "domain": domain,
+        "is_in_scope": False,
+        "retrieved_docs": "",
+        "draft_response": "",
+        "hallucination_detected": False,
+        "loop_count": 0,
+        "final_output": "",
+        "request_id": request_id or "",
+        "tenant_id": tenant_id or "",
+        "is_voice": is_voice,
+        "response_language": response_language or "en-US",
+    }
+    result = _compiled_graph.invoke(state)
+    return result.get("final_output") or "Sorry, I cannot answer that right now."
+
+
+async def run_bot_stream(
+    query: str,
+    domain: str,
+    *,
+    request_id: str = "",
+    tenant_id: str = "",
+    history: list[dict[str, Any]] = None,
+    is_voice: bool = False,
+    response_language: str = "en-US",
+) -> AsyncIterator[str]:
+    """
+    LangGraph-equivalent path with token streaming for the draft generator (Gemini astream).
+    Scope check, retrieval, and verification stay synchronous; draft generation streams chunks.
+    """
+    state: BotState = {
+        "original_query": query,
+        "history": history or [],
+        "domain": domain,
+        "is_in_scope": False,
+        "retrieved_docs": "",
+        "draft_response": "",
+        "hallucination_detected": False,
+        "loop_count": 0,
+        "final_output": "",
+        "request_id": request_id or "",
+        "tenant_id": tenant_id or "",
+        "is_voice": is_voice,
+        "response_language": response_language or "en-US",
+    }
+    state = check_input_scope(state)
+    if not state["is_in_scope"]:
+        if not state.get("is_voice", False):
+            state = polite_refusal(state)
+            msg = state.get("final_output") or ""
+            if msg:
+                yield msg
+            return
+
+    state = retrieve_context(state)
+    llm = _get_llm()
+
+    pieces: list[str] = []
+    async for chunk in llm.astream(_draft_prompt(state)):
+        text = _extract_text_content(chunk)
+        if text:
+            pieces.append(text)
+            yield text
+    state["draft_response"] = "".join(pieces).strip()
+    state = verify_output(state)
+
+    while state["hallucination_detected"]:
+        if state["loop_count"] >= 3:
+            state = polite_refusal(state)
+            out = state.get("final_output") or ""
+            if out:
+                yield out
+            return
+        pieces = []
+        async for chunk in llm.astream(_draft_prompt(state)):
+            text = _extract_text_content(chunk)
+            if text:
+                pieces.append(text)
+                yield text
+        state["draft_response"] = "".join(pieces).strip()
+        state = verify_output(state)

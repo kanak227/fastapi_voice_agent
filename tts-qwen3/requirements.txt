@@ -1,0 +1,19 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+pydantic>=2.8.0
+# qwen-tts==0.1.1 hard-pins transformers==4.57.3 and we keep that — it's the
+# version the model was published against. The original "missing
+# preprocessor_config.json" crash was caused by HF_HOME + TRANSFORMERS_CACHE
+# both set to /models, splitting the cache into /models/... and /models/hub/...
+# (only the latter had the file). The Dockerfile now sets HF_HOME only.
+#
+# torch 2.12+ has a `Duplicate dispatch rule for sys.intern` regression in
+# torch._dynamo polyfills. torch 2.7.1 is the newest stable before that.
+torch==2.7.1
+torchaudio==2.7.1
+torchvision==0.22.1
+qwen-tts==0.1.1
+soundfile>=0.13.0
+numpy>=2.1.0
+uroman>=1.3.1
+indic-transliteration>=2.3.62

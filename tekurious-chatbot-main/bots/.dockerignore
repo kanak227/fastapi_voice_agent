@@ -1,0 +1,23 @@
+# Exclude dev/test artifacts from Docker build
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache
+**/.venv
+**/venv
+**/.env
+**/.env.local
+**/.env.*.local
+**/*.egg-info
+**/.DS_Store
+**/node_modules
+**/.git
+**/.gitignore
+
+# Exclude per-bot requirements (we use shared one)
+*/requirements.txt
+*/src/requirements.txt
+
+# Exclude Azure S2S POC files (not needed in production)
+*/src/server/s2s.py

@@ -1,7 +1,17 @@
-    
-import os, json
+import os
+import json
 
 DHOME = "src"
+
+
+def gemini_model_for_chat() -> str:
+    """Model name for langchain_google_genai (strip optional ``models/`` prefix)."""
+    raw = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+    if raw.startswith("models/"):
+        return raw[len("models/") :]
+    return raw
+
+
 LOGS = os.path.join(os.getcwd(), "runtime", "logs")
 
 def write_to_json_file(output_json_file, json_data):

@@ -25,7 +25,6 @@ env/
 Thumbs.db
 .vscode/
 .idea/
-.sfdx/
 
 # Local runtime and secrets
 *.log
@@ -34,6 +33,23 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+!.env.local.example
 
-# Preserve nested repo metadata locally, do not upload
+# Storage (ephemeral on Cloud Run)
+fastapi_server/storage/
+
+# AWS (replaced by GCP)
+deployment/aws/
+*.task.json
+ecs-*.json
+ecsApp*.json
+trust-ecs*.json
+vercel-fastapi-env.txt
+
+# Vercel / Render (replaced by GCP)
+.vercel/
+render.yaml
+vercel.json
+
+# Nested git backups
 .nested-git-backup/

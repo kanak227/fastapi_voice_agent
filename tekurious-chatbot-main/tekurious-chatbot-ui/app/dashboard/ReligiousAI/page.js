@@ -3,13 +3,35 @@
 import { useState, useRef, useEffect } from 'react';
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
-import { Send, Trash, Loader2 } from "lucide-react";
+import { Send, Trash, Loader2, Globe } from "lucide-react";
 import { Sidebar } from '@/app/components/Sidebar';
 import { VoiceOrb } from '@/components/voice-orb';
 import { useVoiceChat } from '@/hooks/use-voice-chat';
 import { streamRecordedVoiceTurn } from '@/lib/voice-streaming';
+import { playAudioChunk } from '@/lib/audio-playback';
+import { ChatMessage } from '@/components/chat-message';
 
-// Sidebar Component
+import { TtsSettingsPanel } from '@/components/tts-settings-panel';
+// Supported languages for voice input/output
+const VOICE_LANGUAGES = [
+  { code: 'en-US',    label: 'English',    flag: '🇺🇸' },
+  { code: 'hi',       label: 'Hindi',      flag: '🇮🇳' },
+  { code: 'hi-Latn',  label: 'Hinglish',   flag: '🇮🇳' },
+  { code: 'ta',       label: 'Tamil',      flag: '🇮🇳' },
+  { code: 'te',       label: 'Telugu',     flag: '🇮🇳' },
+  { code: 'mr',       label: 'Marathi',    flag: '🇮🇳' },
+  { code: 'bn',       label: 'Bengali',    flag: '🇮🇳' },
+  { code: 'gu',       label: 'Gujarati',   flag: '🇮🇳' },
+  { code: 'kn',       label: 'Kannada',    flag: '🇮🇳' },
+  { code: 'ml',       label: 'Malayalam',  flag: '🇮🇳' },
+  { code: 'pa',       label: 'Punjabi',    flag: '🇮🇳' },
+  { code: 'fr',       label: 'French',     flag: '🇫🇷' },
+  { code: 'de',       label: 'German',     flag: '🇩🇪' },
+  { code: 'es',       label: 'Spanish',    flag: '🇪🇸' },
+  { code: 'ar',       label: 'Arabic',     flag: '🇸🇦' },
+  { code: 'zh',       label: 'Chinese',    flag: '🇨🇳' },
+  { code: 'ja',       label: 'Japanese',   flag: '🇯🇵' },
+];
 
 export default function Dashboard() {
   const [message, setMessage] = useState('');
@@ -20,10 +42,18 @@ export default function Dashboard() {
   /** idle | processing | speaking — voice pipeline only (no duplicate chat bubbles). */
   const [voicePhase, setVoicePhase] = useState('idle');
   const [handsFreeVoiceEnabled, setHandsFreeVoiceEnabled] = useState(false);
+  const [voiceLanguage, setVoiceLanguage] = useState('en-US');
+  const [showLangMenu, setShowLangMenu] = useState(false);
+  const voiceLanguageRef = useRef('en-US');
   const isLoadingRef = useRef(false);
   const handsFreeEnabledRef = useRef(false);
   const voiceTurnActiveRef = useRef(false);
   const messagesEndRef = useRef(null);
+  /** Track current audio element so we can stop playback mid-speech */
+  const currentAudioRef = useRef(null);
+  const voiceAbortRef = useRef(false);
+  /** AbortController to cancel the SSE stream on stop */
+  const voiceAbortControllerRef = useRef(null);
   /** Shared across typed chat and voice so FastAPI memory (session_id) stays consistent. */
   const voiceSessionIdRef = useRef(`religious-session-${Date.now()}`);
 
@@ -60,6 +90,17 @@ export default function Dashboard() {
     handsFreeEnabledRef.current = handsFreeVoiceEnabled;
   }, [handsFreeVoiceEnabled]);
 
+  useEffect(() => {
+    if (!showLangMenu) return;
+    const close = () => setShowLangMenu(false);
+    document.addEventListener('click', close);
+    return () => document.removeEventListener('click', close);
+  }, [showLangMenu]);
+
+  useEffect(() => {
+    voiceLanguageRef.current = voiceLanguage;
+  }, [voiceLanguage]);
+
   const sendVoiceMessage = async (transcript) => {
     const text = (transcript || '').trim();
     if (!text || isLoadingRef.current) return;
@@ -78,17 +119,37 @@ export default function Dashboard() {
   };
 
   const playBase64Audio = async (audioB64, mimeType = 'audio/mpeg') => {
+    if (voiceAbortRef.current) return; // Skip if speech was stopped
     const audio = new Audio(`data:${mimeType};base64,${audioB64}`);
-    await new Promise((resolve, reject) => {
-      audio.onended = resolve;
-      audio.onerror = () => reject(new Error('Audio playback failed.'));
-      audio.play().catch(reject);
+    currentAudioRef.current = audio;
+    await new Promise((resolve) => {
+      audio.onended = () => { currentAudioRef.current = null; resolve(); };
+      audio.onerror = () => { currentAudioRef.current = null; resolve(); };
+      audio.onpause = () => { currentAudioRef.current = null; resolve(); };
+      audio.play().catch(() => { currentAudioRef.current = null; resolve(); });
     });
+  };
+
+  const stopVoicePlayback = () => {
+    voiceAbortRef.current = true;
+    // Abort the SSE fetch stream
+    if (voiceAbortControllerRef.current) {
+      voiceAbortControllerRef.current.abort();
+      voiceAbortControllerRef.current = null;
+    }
+    // Stop current audio
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current.currentTime = 0;
+      currentAudioRef.current = null;
+    }
+    setVoicePhase('idle');
   };
 
   const handleVoiceTurn = async ({ audio_b64, sample_rate_hz }) => {
     if (voiceTurnActiveRef.current) return;
     voiceTurnActiveRef.current = true;
+    voiceAbortRef.current = false; // Reset abort flag for new turn
     try {
       setVoicePhase('processing');
       setVoiceError('');
@@ -114,13 +175,24 @@ export default function Dashboard() {
       };
 
       let didAddBotBubble = false;
+      let botBubbleId = null;
+
+      // Create abort controller for this voice turn
+      const abortController = new AbortController();
+      voiceAbortControllerRef.current = abortController;
+
       const turnResult = await streamRecordedVoiceTurn({
         session_id: voiceSessionIdRef.current,
         audio_b64,
         sample_rate_hz,
         domain: 'religious',
-        language: 'en-US',
+        language: voiceLanguageRef.current,
         stream: true,
+        history: messages.map(m => ({
+          role: m.sender === 'bot' ? 'assistant' : 'user',
+          content: m.content
+        })),
+        abortSignal: abortController.signal,
         onTranscript: (t) => {
           const text = String(t || '').trim();
           if (!text) return;
@@ -140,23 +212,58 @@ export default function Dashboard() {
             stopListening({ finalize: false }).catch(() => {});
           }
         },
+        onTextToken: (token) => {
+          if (voiceAbortRef.current) return;
+          // Stream original formatted text (with emojis, bold, etc.) in real-time
+          if (!botBubbleId) {
+            botBubbleId = Date.now() + Math.random();
+            didAddBotBubble = true;
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: botBubbleId,
+                content: token,
+                sender: 'bot',
+                time: formatTime(new Date()),
+              },
+            ]);
+          } else {
+            setMessages((prev) =>
+              prev.map((msg) =>
+                msg.id === botBubbleId
+                  ? { ...msg, content: msg.content + token }
+                  : msg
+              )
+            );
+          }
+        },
         onFinalText: (text) => {
+          // Update bubble with final complete text (ensures nothing is missed)
           const reply = String(text || '').trim();
           if (!reply) return;
-          didAddBotBubble = true;
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: Date.now() + Math.random(),
-              content: reply,
-              sender: 'bot',
-              time: formatTime(new Date()),
-            },
-          ]);
+          if (botBubbleId) {
+            setMessages((prev) =>
+              prev.map((msg) =>
+                msg.id === botBubbleId ? { ...msg, content: reply } : msg
+              )
+            );
+          } else if (!didAddBotBubble) {
+            didAddBotBubble = true;
+            botBubbleId = Date.now() + Math.random();
+            setMessages((prev) => [
+              ...prev,
+              { id: botBubbleId, content: reply, sender: 'bot', time: formatTime(new Date()) },
+            ]);
+          }
         },
         onAudioChunk: async (chunk) => {
+          if (voiceAbortRef.current) return;
+          // Play audio (normalized text) concurrently while text streams
           setVoicePhase('speaking');
-          await playBase64Audio(chunk.audio_b64, chunk.mime_type || 'audio/mpeg');
+          await playAudioChunk(chunk, {
+            shouldAbort: () => voiceAbortRef.current,
+            onPlay: (audio) => { currentAudioRef.current = audio; },
+          });
         },
       });
 
@@ -174,10 +281,14 @@ export default function Dashboard() {
         ]);
       }
     } catch (err) {
-      setVoiceError(err?.message || 'Voice conversation failed.');
+      // AbortError is expected when user stops playback — not an error
+      if (err?.name !== 'AbortError') {
+        setVoiceError(err?.message || 'Voice conversation failed.');
+      }
     } finally {
       voiceTurnActiveRef.current = false;
-      setVoicePhase('idle');
+      voiceAbortControllerRef.current = null;
+      if (voicePhase !== 'idle') setVoicePhase('idle');
     }
   };
 
@@ -193,6 +304,7 @@ export default function Dashboard() {
     onTranscript: undefined,
     onAudioCaptured: handleVoiceTurn,
     onError: (msg) => setVoiceError(msg),
+    language: voiceLanguageRef.current,
     manualMode: false,
   });
 
@@ -208,6 +320,11 @@ const sendMessageToAPI = async (userMessage) => {
   try {
     setIsLoading(true);
 
+    const historyPayload = messages.map(m => ({
+      role: m.sender === 'bot' ? 'assistant' : 'user',
+      content: m.content
+    }));
+
     const response = await fetch("/api/ReligiousAI", {
       method: "POST",
       headers: {
@@ -216,6 +333,8 @@ const sendMessageToAPI = async (userMessage) => {
       body: JSON.stringify({
         query: userMessage,
         session_id: voiceSessionIdRef.current,
+        history: historyPayload,
+        language: voiceLanguageRef.current,
       }),
     });
 
@@ -260,6 +379,11 @@ const sendMessageToAPI = async (userMessage) => {
 
   const handleVoiceOrbPress = async () => {
     try {
+      // If currently speaking or processing, stop everything
+      if (voicePhase === 'speaking' || voicePhase === 'processing') {
+        stopVoicePlayback();
+        return;
+      }
       if (handsFreeEnabledRef.current) {
         setHandsFreeVoiceEnabled(false);
         await stopListening();
@@ -321,7 +445,7 @@ const sendMessageToAPI = async (userMessage) => {
   }
 
   const voiceOrbDisabled =
-    !voiceSupported || isLoading || isTranscribing;
+    !voiceSupported || isLoading;
 
   return (
     <div className="flex h-screen w-full bg-zinc-100">
@@ -386,7 +510,7 @@ const sendMessageToAPI = async (userMessage) => {
                           : 'rounded-bl-md border border-zinc-200/80 bg-zinc-50/80 text-zinc-800 shadow-sm'
                       }`}
                     >
-                      <p className="whitespace-pre-wrap text-[15px] leading-relaxed">{msg.content}</p>
+                      <ChatMessage content={msg.content} isBot={msg.sender === 'bot'} />
                       <p
                         className={`mt-1.5 text-[11px] tabular-nums ${
                           msg.sender === 'user' ? 'text-zinc-400' : 'text-zinc-400'
@@ -413,6 +537,41 @@ const sendMessageToAPI = async (userMessage) => {
 
             <div className="border-t border-zinc-200/80 bg-zinc-50/90 px-4 py-3">
               <div className="mx-auto max-w-3xl">
+                {/* Language selector row */}
+                <div className="mb-2 flex items-center gap-2">
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={() => setShowLangMenu(prev => !prev)}
+                      className="flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:border-zinc-300 hover:bg-zinc-50 transition-colors"
+                    >
+                      <Globe className="h-3.5 w-3.5 text-zinc-500" />
+                      <span>{VOICE_LANGUAGES.find(l => l.code === voiceLanguage)?.flag}</span>
+                      <span>{VOICE_LANGUAGES.find(l => l.code === voiceLanguage)?.label}</span>
+                      <span className="text-zinc-400">▾</span>
+                    </button>
+                    {showLangMenu && (
+                      <div className="absolute bottom-full left-0 mb-1 z-50 w-44 rounded-xl border border-zinc-200 bg-white shadow-lg overflow-hidden">
+                        <div className="max-h-64 overflow-y-auto py-1">
+                          {VOICE_LANGUAGES.map(lang => (
+                            <button
+                              key={lang.code}
+                              type="button"
+                              onClick={() => { setVoiceLanguage(lang.code); setShowLangMenu(false); }}
+                              className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-zinc-50 transition-colors ${voiceLanguage === lang.code ? 'bg-zinc-100 font-medium text-zinc-900' : 'text-zinc-700'}`}
+                            >
+                              <span>{lang.flag}</span>
+                              <span>{lang.label}</span>
+                              {voiceLanguage === lang.code && <span className="ml-auto text-zinc-400">✓</span>}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  <span className="text-xs text-zinc-400">Voice language</span>
+                  <TtsSettingsPanel className="ml-auto" />
+                </div>
                 <div className="flex items-end gap-2">
                   <VoiceOrb
                     state={voiceHudMode}

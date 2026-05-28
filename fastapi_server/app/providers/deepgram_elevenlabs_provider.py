@@ -93,11 +93,25 @@ class DeepgramElevenLabsProvider(SpeechProvider):
         rid = request_id or str(uuid.uuid4())
         lang = (language or config.DEEPGRAM_LANGUAGE or "en-US").strip() or "en-US"
 
+        # Map language codes to the best Deepgram model that supports them.
+        # Nova-3 supports Indian regional languages (ta, te, kn, ml, bn, mr, gu, pa)
+        # added in Jan 2026. Nova-2 handles English, Hindi, and major world languages.
+        _NOVA3_LANGUAGES = {"ta", "te", "kn", "ml", "bn", "mr", "gu", "pa", "tl", "be", "bs", "hr", "mk", "sr", "sl"}
+
+        # For Hinglish (hi-Latn), use Hindi model
+        deepgram_lang = "hi" if lang == "hi-Latn" else lang
+        # Strip region suffix for lookup (e.g. "en-US" -> "en")
+        lang_base = deepgram_lang.split("-")[0].lower()
+
+        deepgram_model = "nova-3" if lang_base in _NOVA3_LANGUAGES else config.DEEPGRAM_MODEL
+
         params = {
-            "model": config.DEEPGRAM_MODEL,
-            "language": lang,
+            "model": deepgram_model,
+            "language": deepgram_lang,
             "smart_format": "true",
             "punctuate": "true",
+            "utterances": "false",
+            "filler_words": "false",
         }
 
         headers = {
@@ -156,13 +170,13 @@ class DeepgramElevenLabsProvider(SpeechProvider):
             request_id=rid,
             provider=self.name,
             text=text.strip() if isinstance(text, str) else "",
-            language=lang,
+            language=lang,  # Return original language code, not the mapped one
             confidence=confidence,
             segments=segments,
             raw=None,
         )
 
-    async def list_voices(self) -> list[dict]:
+    async def list_voices(self, language: str | None = None) -> list[dict]:
         if not config.ELEVENLABS_API_KEY:
             raise DeepgramElevenLabsError("ELEVENLABS_API_KEY is not set")
 
@@ -195,13 +209,71 @@ class DeepgramElevenLabsProvider(SpeechProvider):
             voices.append(
                 {
                     "name": item.get("name") or item.get("voice_id"),
+                    "voice_id": item.get("voice_id"),
                     "locale": locale,
                     "gender": labels.get("gender") if isinstance(labels, dict) else None,
-                    "provider": self.name,
+                    "provider": "elevenlabs",
                 }
             )
 
-        return [v for v in voices if v.get("name")]
+        filtered_voices = [v for v in voices if v.get("name")]
+        
+        # Filter by language if provided
+        if language:
+            lang_base = language.split("-")[0].lower()
+            filtered_voices = [
+                v for v in filtered_voices
+                if v.get("locale") and v["locale"].split("-")[0].lower() == lang_base
+            ]
+        
+        return filtered_voices
+
+    async def list_voices_qwen(self, language: str | None = None) -> list[dict]:
+        """Voices exposed by the self-hosted Qwen3+MMS TTS service."""
+        if not config.QWEN_TTS_BASE_URL:
+            return []
+        url = f"{config.QWEN_TTS_BASE_URL.rstrip('/')}/voices"
+        headers: dict[str, str] = {}
+        if config.QWEN_TTS_API_KEY:
+            headers["xi-api-key"] = config.QWEN_TTS_API_KEY
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, headers=headers)
+        except httpx.HTTPError:
+            return []
+        if resp.status_code >= 400:
+            return []
+        try:
+            payload = resp.json()
+        except Exception:
+            return []
+        items = payload.get("voices") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return []
+        out: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            labels = item.get("labels") if isinstance(item.get("labels"), dict) else {}
+            out.append({
+                "name": item.get("name") or item.get("voice_id"),
+                "voice_id": item.get("voice_id"),
+                "locale": labels.get("accent") if isinstance(labels, dict) else None,
+                "gender": labels.get("gender") if isinstance(labels, dict) else None,
+                "provider": "qwen",
+            })
+        
+        filtered_out = [v for v in out if v.get("voice_id")]
+        
+        # Filter by language if provided
+        if language:
+            lang_base = language.split("-")[0].lower()
+            filtered_out = [
+                v for v in filtered_out
+                if v.get("locale") and v["locale"].split("-")[0].lower() == lang_base
+            ]
+        
+        return filtered_out
 
     async def synthesize_text(
         self,
@@ -212,43 +284,73 @@ class DeepgramElevenLabsProvider(SpeechProvider):
         emotion: Optional[str] = None,
         request_id: Optional[str] = None,
         output_format: Optional[str] = None,
+        tts_provider: Optional[str] = None,
     ) -> tuple[bytes, str, str | None, str]:
-        if not config.ELEVENLABS_API_KEY:
-            raise DeepgramElevenLabsError("ELEVENLABS_API_KEY is not set")
+        # Route to the self-hosted Qwen3 + MMS service when requested.
+        use_qwen = (tts_provider or "").strip().lower() == "qwen"
+        if use_qwen and config.QWEN_TTS_BASE_URL:
+            base_url = config.QWEN_TTS_BASE_URL
+            api_key = config.QWEN_TTS_API_KEY or ""
+            voice_id = (voice or config.QWEN_TTS_DEFAULT_VOICE_ID or "serena").strip()
+            backend_label = "qwen"
+        else:
+            if not config.ELEVENLABS_API_KEY:
+                raise DeepgramElevenLabsError("ELEVENLABS_API_KEY is not set")
+            base_url = config.ELEVENLABS_BASE_URL
+            api_key = config.ELEVENLABS_API_KEY
+            voice_id = (voice or config.ELEVENLABS_VOICE_ID or "").strip()
+            backend_label = "elevenlabs"
 
-        voice_id = (voice or config.ELEVENLABS_VOICE_ID or "").strip()
         if not voice_id:
-            raise DeepgramElevenLabsError("ELEVENLABS_VOICE_ID is not set")
+            raise DeepgramElevenLabsError(f"Voice id is not set for {backend_label}")
 
         rid = request_id or str(uuid.uuid4())
 
         fmt = (output_format or "mp3_44100_128").strip()
         mime = "audio/mpeg" if fmt.startswith("mp3") else "audio/wav"
 
-        url = f"{config.ELEVENLABS_BASE_URL.rstrip('/')}/text-to-speech/{voice_id}"
-        payload = {
+        # Map BCP-47 language codes to ElevenLabs language_code format
+        _ELEVENLABS_LANG_MAP = {
+            "en-US": "en", "en": "en",
+            "hi": "hi", "hi-Latn": "hi",
+            "ta": "ta", "te": "te", "mr": "mr", "bn": "bn",
+            "gu": "gu", "kn": "kn", "ml": "ml", "pa": "pa", "ur": "ur",
+            "fr": "fr", "de": "de", "es": "es",
+            "ar": "ar", "zh": "zh", "ja": "ja",
+            "pt": "pt", "it": "it", "pl": "pl",
+            "nl": "nl", "sv": "sv", "ru": "ru",
+        }
+        lang_code = (language or "en-US").strip()
+        elevenlabs_lang = _ELEVENLABS_LANG_MAP.get(lang_code, lang_code.split("-")[0])
+
+        url = f"{base_url.rstrip('/')}/text-to-speech/{voice_id}"
+        payload: dict = {
             "text": self._strip_emotion_label(text),
             "model_id": self._normalize_elevenlabs_model(config.ELEVENLABS_MODEL_ID),
             "output_format": fmt,
+            "language_code": elevenlabs_lang,
         }
         voice_settings = self._emotion_to_voice_settings(emotion)
         if voice_settings:
             payload["voice_settings"] = voice_settings
 
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg" if mime == "audio/mpeg" else "audio/wav",
+        }
+        if api_key:
+            headers["xi-api-key"] = api_key
+
         async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                url,
-                headers={
-                    "xi-api-key": config.ELEVENLABS_API_KEY,
-                    "Content-Type": "application/json",
-                    "Accept": "audio/mpeg" if mime == "audio/mpeg" else "audio/wav",
-                },
-                json=payload,
-            )
+            resp = await client.post(url, headers=headers, json=payload)
 
         if resp.status_code >= 400:
             raise DeepgramElevenLabsError(
-                f"ElevenLabs TTS request failed (status={resp.status_code}): {resp.text}"
+                f"{backend_label} TTS request failed (status={resp.status_code}): {resp.text}"
             )
 
-        return (resp.content, mime, voice_id, rid)
+        # Trust the upstream Content-Type — works whether the server is
+        # ElevenLabs or our Qwen3 drop-in (which may return audio/wav for
+        # mp3 requests when libsndfile lacks mp3 support).
+        upstream_mime = (resp.headers.get("content-type") or mime).split(";")[0].strip() or mime
+        return (resp.content, upstream_mime, voice_id, rid)

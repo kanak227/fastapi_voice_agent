@@ -20,11 +20,11 @@ function getDomain(value) {
  * Speech-safe clip: keep up to two sentences (answer + optional follow-up), within maxChars.
  * Matches FastAPI VOICE_AGENT_POLICY (concise but may end with a short follow-up question).
  */
-function clampVoiceAssistantReply(text, maxChars = 280) {
+function clampVoiceAssistantReply(text, maxChars = 2000) {
   const t = String(text || "").trim().replace(/\s+/g, " ");
   if (!t) return "";
   const parts = t.split(/(?<=[.!?])\s+/).filter(Boolean);
-  let out = parts.slice(0, 2).join(" ").trim() || t;
+  let out = parts.slice(0, 10).join(" ").trim() || t;
   if (out.length > maxChars) {
     const slice = out.slice(0, maxChars - 3);
     const lastSpace = slice.lastIndexOf(" ");
@@ -34,14 +34,19 @@ function clampVoiceAssistantReply(text, maxChars = 280) {
   return out;
 }
 
-async function synthesizeText(baseUrl, language, text) {
+async function synthesizeText(baseUrl, language, text, ttsProvider, ttsVoice) {
   const ttsResponse = await fetch(`${baseUrl}/voice/synthesize`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-Tenant-Id": getFastApiTenantId(),
     },
-    body: JSON.stringify({ text, language }),
+    body: JSON.stringify({
+      text,
+      language,
+      ...(ttsProvider ? { tts_provider: ttsProvider } : {}),
+      ...(ttsVoice ? { voice: ttsVoice } : {}),
+    }),
   });
 
   const ttsData = await ttsResponse.json().catch(() => ({}));
@@ -158,6 +163,8 @@ export async function POST(request) {
   const domain = getDomain(body.domain);
   const sessionId = body.session_id || `voice-${Date.now()}`;
   const wantsStream = Boolean(body.stream);
+  const ttsProvider = body.tts_provider === "qwen" ? "qwen" : (body.tts_provider === "elevenlabs" ? "elevenlabs" : null);
+  const ttsVoice = typeof body.tts_voice === "string" && body.tts_voice.trim() ? body.tts_voice.trim() : null;
 
   try {
     // STT is handled by FastAPI in this pipeline; we keep it here to validate transcript + apply intent guardrails.
@@ -203,7 +210,7 @@ export async function POST(request) {
         const fallbackText = domain === "religious" ? RELIGIOUS_FALLBACK : EDUCATION_FALLBACK;
         const shortFallback = clampVoiceAssistantReply(fallbackText, 200);
 
-        const voicedFallback = await synthesizeText(baseUrl, language, shortFallback);
+        const voicedFallback = await synthesizeText(baseUrl, language, shortFallback, ttsProvider, ttsVoice);
         if (!voicedFallback || voicedFallback.audio_chunks.length === 0) {
           return NextResponse.json(
             { error: "Voice synthesis failed for fallback response.", transcript: transcriptText },
@@ -241,7 +248,12 @@ export async function POST(request) {
           "Content-Type": "application/json",
           "X-Tenant-Id": getFastApiTenantId(),
         },
-        body: JSON.stringify({ ...agentPayloadBase, output_audio: true }),
+        body: JSON.stringify({
+          ...agentPayloadBase,
+          output_audio: true,
+          ...(ttsProvider ? { tts_provider: ttsProvider } : {}),
+          ...(ttsVoice ? { tts_voice: ttsVoice } : {}),
+        }),
       });
 
       if (!upstreamResponse.ok) {
@@ -297,10 +309,10 @@ export async function POST(request) {
     }
 
     const shortText =
-      clampVoiceAssistantReply(mergedReply, 280) ||
+      clampVoiceAssistantReply(mergedReply, 2000) ||
       "I’m not sure how to answer that briefly. Please try rephrasing.";
 
-    const voiced = await synthesizeText(baseUrl, language, shortText);
+    const voiced = await synthesizeText(baseUrl, language, shortText, ttsProvider, ttsVoice);
     if (!voiced || voiced.audio_chunks.length === 0) {
       return NextResponse.json(
         { error: "Voice synthesis failed.", transcript: transcriptText },

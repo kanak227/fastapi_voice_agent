@@ -1,34 +1,35 @@
 from __future__ import annotations
 
+import asyncio
 import base64
-import io
 import json
+import logging
 import re
 import uuid
-import wave
+from typing import Any
 
-
-import logging
-logging.basicConfig(level=logging.INFO)
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 
+from app.core.agent_routing import resolve_agent_domain_for_routing
 from app.dependencies import get_speech_provider, get_tenant_id
 from app.providers.speech_provider import SpeechProvider
-from app.schemas.agent import AgentStreamRequest, AgentAudioInput
-
-from app.services.conversation_brain import conversation_brain
+from app.schemas.agent import AgentAudioInput, AgentDomain, AgentStreamRequest
+from app.schemas.interaction import NormalizedInteractionInput
+from app.services.bot_gateway_client import UpstreamBotHttpError, open_bot_stream_post
 from app.services.input_router import input_router
-from app.core.intent_guard import is_allowed_intent, RELIGIOUS_FALLBACK, EDUCATION_FALLBACK
+from app.services.sentence_buffer_service import (
+    DEFAULT_MAX_CHUNK_WORDS,
+    QWEN_MAX_CHUNK_WORDS,
+    sentence_buffer_service,
+)
+from app.services.sse_assembler import SSEAssembler
+from app.services.voice_text_normalizer import voice_text_normalizer
 
-logger = logging.getLogger("agent_debug")
-
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agent", tags=["agent"])
-
-
-def sse_event(event: str, data: str) -> str:
-    return f"event: {event}\ndata: {data}\n\n"
 
 
 def _validate_tenant_id(tenant_id: str | None) -> str:
@@ -42,96 +43,304 @@ def _validate_tenant_id(tenant_id: str | None) -> str:
     return value
 
 
-def _pcm16_to_wav(pcm16_bytes: bytes, sample_rate_hz: int) -> bytes:
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate_hz)
-        wf.writeframes(pcm16_bytes)
-    return buf.getvalue()
-
-
 async def _emit_json(websocket: WebSocket, event: str, data: dict | str) -> None:
     await websocket.send_json({"event": event, "data": data})
 
 
+def _bot_json_payload(body: AgentStreamRequest, interaction: NormalizedInteractionInput) -> dict[str, Any]:
+    text = (interaction.normalized_text or "").strip()
+    out: dict[str, Any] = {
+        "query": text,
+        "session_id": body.session_id,
+        "use_knowledge": body.use_knowledge,
+        "knowledge_top_k": body.knowledge_top_k,
+        "input_type": interaction.input_type or "text",
+        "language": body.language or "en-US",
+    }
+    if body.access_level is not None:
+        out["access_level"] = body.access_level
+    if body.provider:
+        out["provider"] = body.provider
+    if body.llm_model:
+        out["llm_model"] = body.llm_model
+    if body.history is not None:
+        out["history"] = body.history
+    return out
+
+
+def _maybe_json(data: str) -> Any:
+    data = data.strip()
+    if not data:
+        return ""
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError:
+        return data
+
 
 @router.post("/stream")
 async def stream_agent(
+    request: Request,
     body: AgentStreamRequest,
     tenant_id: str = Depends(get_tenant_id),
     provider: SpeechProvider = Depends(get_speech_provider),
 ):
-    logger.info("[AGENT DEBUG] Entered stream_agent endpoint")
-    async def _generator():
-        logger.info("[AGENT DEBUG] Incoming request body: %s", body)
+    """
+    Thin proxy: normalize input (STT if needed), then stream the domain bot HTTP body
+    as chunks arrive (no full-body buffering on the gateway).
+    """
+    request_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
 
-        try:
-            interaction, route_meta = await input_router.normalize(body, provider)
-        except Exception as exc:
-            logger.info("[AGENT DEBUG] input_router.normalize error: %s", exc)
-            err = {"ok": False, "error": "input_normalization_failed", "detail": str(exc)}
-            yield sse_event("done", json.dumps(err, ensure_ascii=True))
-            return
+    try:
+        interaction, route_meta = await input_router.normalize(body, provider)
+    except Exception as exc:
+        logger.info("input_router_failed request_id=%s detail=%s", request_id, exc)
 
-        if interaction is None:
-            logger.info("[AGENT DEBUG] interaction is None, route_meta: %s", route_meta)
-            yield sse_event("input", json.dumps(route_meta, ensure_ascii=True))
-            yield sse_event("done", json.dumps({"ok": False, **route_meta}, ensure_ascii=True))
-            return
+        async def err_simple():
+            yield f"event: done\ndata: {json.dumps({'ok': False, 'error': 'input_normalization_failed', 'detail': str(exc)}, ensure_ascii=True)}\n\n".encode()
 
-        # --- GUARDRAIL ENFORCEMENT ---
-        domain = None
-        tenant = (tenant_id or "").lower()
-        print(f"[DEBUG] tenant_id: {tenant_id}, tenant: {tenant}")
-        if "religious" in tenant:
-            domain = "religious"
-        elif "education" in tenant or "eduthum" in tenant:
-            domain = "education"
-        if hasattr(body, "domain") and body.domain:
-            domain = str(body.domain).lower()
-        print(f"[DEBUG] body.domain: {getattr(body, 'domain', None)}")
-        print(f"[DEBUG] resolved domain: {domain}")
+        return StreamingResponse(err_simple(), media_type="text/event-stream")
 
-        user_text = getattr(interaction, "normalized_text", None) or ""
-        print(f"[DEBUG] user_text: {user_text}")
-        logger.info(f"[AGENT DEBUG] user_text: {user_text}, domain: {domain}")
-        allowed, explanation = is_allowed_intent(user_text, domain)
-        logger.info(f"[AGENT DEBUG] is_allowed_intent: {allowed}, explanation: {explanation}")
-        print(f"[DEBUG] is_allowed_intent: {allowed}, explanation: {explanation}")
-        if allowed != "YES":
-            logger.info(f"[AGENT DEBUG] Blocked by guardrail: {explanation}")
-            if domain == "religious":
-                yield sse_event("final_text", RELIGIOUS_FALLBACK)
-                yield sse_event("done", json.dumps({"ok": True, "guardrail": "religious", "explanation": explanation}, ensure_ascii=True))
-            elif domain == "education":
-                yield sse_event("final_text", EDUCATION_FALLBACK)
-                yield sse_event("done", json.dumps({"ok": True, "guardrail": "education", "explanation": explanation}, ensure_ascii=True))
-            else:
-                yield sse_event("final_text", "Sorry, I can't assist with that.")
-                yield sse_event("done", json.dumps({"ok": True, "guardrail": "default", "explanation": explanation}, ensure_ascii=True))
-            return
+    if interaction is None:
 
-        yield sse_event("input", json.dumps(route_meta, ensure_ascii=True))
+        async def early():
+            yield f"event: input\ndata: {json.dumps(route_meta, ensure_ascii=True)}\n\n".encode()
+            yield f"event: done\ndata: {json.dumps({'ok': False, **route_meta}, ensure_ascii=True)}\n\n".encode()
 
-        try:
-            async for event in conversation_brain.stream(
-                interaction=interaction,
-                body=body,
-                provider=provider,
-                tenant_id=tenant_id,
-            ):
-                name = str(event.get("event") or "message")
-                payload = event.get("data")
-                serialized = payload if isinstance(payload, str) else json.dumps(payload or {}, ensure_ascii=True)
-                yield sse_event(name, serialized)
-        except Exception as exc:
-            err = {"ok": False, "error": "llm_or_stream_failed", "detail": str(exc)}
-            yield sse_event("done", json.dumps(err, ensure_ascii=True))
-            return
+        return StreamingResponse(early(), media_type="text/event-stream")
 
-    return StreamingResponse(_generator(), media_type="text/event-stream")
+    explicit = body.domain.value if body.domain is not None else None
+    domain_key = resolve_agent_domain_for_routing(tenant_id, explicit)
+    if not domain_key:
+        msg = {
+            "ok": False,
+            "error": "domain_not_resolved",
+            "detail": "Set a valid `domain` on the request or use an X-Tenant-Id that maps to a domain.",
+        }
+
+        async def dom_err():
+            yield f"event: status\ndata: {json.dumps(msg, ensure_ascii=True)}\n\n".encode()
+            yield f"event: done\ndata: {json.dumps(msg, ensure_ascii=True)}\n\n".encode()
+
+        return StreamingResponse(dom_err(), media_type="text/event-stream")
+
+    logger.info(
+        "stream_proxy_start request_id=%s tenant_id=%s domain_key=%s",
+        request_id,
+        tenant_id,
+        domain_key,
+    )
+
+    json_body = _bot_json_payload(body, interaction)
+
+    try:
+        media_type, stream = await open_bot_stream_post(
+            domain_key=domain_key,
+            json_body=json_body,
+            tenant_id=tenant_id,
+            request_id=request_id,
+            request=request,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UpstreamBotHttpError as exc:
+        logger.warning(
+            "bot_http_error request_id=%s status=%s",
+            request_id,
+            exc.status_code,
+        )
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except httpx.RequestError as exc:
+        logger.warning("bot_transport_error request_id=%s detail=%s", request_id, exc)
+        raise HTTPException(status_code=502, detail="Domain bot unreachable") from exc
+
+    # If output_audio is requested, intercept the bot's SSE stream, buffer sentences,
+    # synthesize TTS per sentence, and emit both text + audio events in real-time.
+    # Text events are emitted IMMEDIATELY; TTS runs in parallel and audio events follow.
+    if body.output_audio:
+        from app.providers.disabled_speech_provider import DisabledSpeechProvider
+
+        if isinstance(provider, DisabledSpeechProvider):
+            # No TTS available — fall through to plain proxy
+            return StreamingResponse(stream, media_type=media_type)
+
+        async def tts_stream():
+            sse = SSEAssembler()
+            text_buffer = ""
+            audio_idx = 0
+            full_text_parts: list[str] = []
+            tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
+            audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+            # Emit transcript/input event if available
+            if route_meta.get("transcript"):
+                yield f"event: input\ndata: {json.dumps(route_meta, ensure_ascii=True)}\n\n".encode()
+
+            async def tts_worker():
+                """Background task: reads sentences from tts_queue, normalizes for speech,
+                synthesizes with lookahead pre-buffering, puts audio into audio_queue.
+
+                Uses a concurrent pipeline: starts synthesizing chunk N+1 immediately
+                after dequeuing it, while chunk N's synthesis is still in-flight.
+                When chunk N completes, it's emitted and chunk N+1 continues synthesizing.
+                This eliminates audible gaps for slow TTS providers like Qwen3 (5-8s per
+                chunk on T4).
+                """
+                nonlocal audio_idx
+
+                async def _synthesize_one(text: str, idx: int):
+                    """Synthesize a single normalized sentence.
+                    Returns SSE-encoded audio event bytes or None on failure.
+                    idx is pre-assigned to guarantee correct ordering.
+                    """
+                    try:
+                        audio_bytes, mime, voice_used, tts_req_id = await provider.synthesize_text(
+                            text=text,
+                            language=body.language,
+                            voice=body.tts_voice,
+                            emotion=body.tts_emotion,
+                            request_id=None,
+                            output_format=body.tts_format,
+                            tts_provider=body.tts_provider,
+                        )
+                        audio_payload = {
+                            "index": idx,
+                            "text": text,
+                            "mime_type": mime,
+                            "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
+                        }
+                        return f"event: audio\ndata: {json.dumps(audio_payload, ensure_ascii=True)}\n\n".encode()
+                    except Exception as tts_exc:
+                        logger.warning("tts_chunk_failed request_id=%s err=%s", request_id, tts_exc)
+                        return None
+
+                # Lookahead pre-buffering pipeline.
+                # We maintain a deque of in-flight synthesis futures (max 2) so that
+                # chunk N+1 is already synthesizing while chunk N is being transmitted.
+                from collections import deque
+                in_flight: deque[asyncio.Task] = deque()
+                MAX_LOOKAHEAD = 2
+
+                while True:
+                    sentence = await tts_queue.get()
+                    if sentence is None:
+                        break
+
+                    # Normalize text for speech (strip markdown, emojis, special chars)
+                    speech_text = voice_text_normalizer.normalize_sentence(sentence)
+                    if not speech_text:
+                        continue
+
+                    # Assign index now to preserve SSE event ordering
+                    idx = audio_idx
+                    audio_idx += 1
+
+                    # Start synthesis immediately (non-blocking)
+                    in_flight.append(asyncio.ensure_future(_synthesize_one(speech_text, idx)))
+
+                    # If we've hit the lookahead limit, await the oldest task and emit it.
+                    # This ensures at most MAX_LOOKAHEAD syntheses run concurrently.
+                    if len(in_flight) >= MAX_LOOKAHEAD:
+                        result = await in_flight.popleft()
+                        if result is not None:
+                            await audio_queue.put(result)
+
+                # Drain all remaining in-flight synthesis tasks in order
+                while in_flight:
+                    result = await in_flight.popleft()
+                    if result is not None:
+                        await audio_queue.put(result)
+
+                await audio_queue.put(None)
+
+            # Start TTS worker in background
+            tts_task = asyncio.create_task(tts_worker())
+
+            # Phase 1: Stream text tokens immediately, queue sentences for TTS
+            async for chunk in stream:
+                for ev, data in sse.feed(chunk):
+                    if ev in ("text", "token", "delta"):
+                        piece = ""
+                        try:
+                            parsed = json.loads(data)
+                            piece = parsed if isinstance(parsed, str) else str(parsed.get("text", parsed) if isinstance(parsed, dict) else parsed)
+                        except (json.JSONDecodeError, TypeError):
+                            piece = data
+                        if not piece:
+                            continue
+
+                        full_text_parts.append(piece)
+                        # Emit text IMMEDIATELY
+                        yield f"event: text\ndata: {json.dumps(piece, ensure_ascii=True)}\n\n".encode()
+
+                        # Buffer for TTS sentence detection. Self-hosted
+                        # Qwen3 has no streaming, so larger chunks reduce
+                        # the audible gaps between clips.
+                        text_buffer += piece
+                        chunk_words = (
+                            QWEN_MAX_CHUNK_WORDS
+                            if (body.tts_provider or "").lower() == "qwen"
+                            else DEFAULT_MAX_CHUNK_WORDS
+                        )
+                        ready, text_buffer = sentence_buffer_service.pop_leading_speech_chunks(
+                            text_buffer, max_chunk_words=chunk_words
+                        )
+                        for sentence in ready:
+                            await tts_queue.put(sentence)
+
+                        # Drain any ready audio events (non-blocking)
+                        while not audio_queue.empty():
+                            item = audio_queue.get_nowait()
+                            if item is None:
+                                break
+                            yield item
+                    elif ev == "done":
+                        pass
+                    else:
+                        yield f"event: {ev}\ndata: {data}\n\n".encode()
+
+            # Drain remaining SSE buffer
+            for ev, data in sse.drain():
+                if ev in ("text", "token", "delta"):
+                    piece = ""
+                    try:
+                        parsed = json.loads(data)
+                        piece = parsed if isinstance(parsed, str) else str(parsed.get("text", parsed) if isinstance(parsed, dict) else parsed)
+                    except (json.JSONDecodeError, TypeError):
+                        piece = data
+                    if piece:
+                        full_text_parts.append(piece)
+                        yield f"event: text\ndata: {json.dumps(piece, ensure_ascii=True)}\n\n".encode()
+                        text_buffer += piece
+
+            # Queue remaining buffered text for TTS
+            if text_buffer.strip():
+                remaining = text_buffer.strip()
+                if remaining and remaining[-1] not in ".!?":
+                    remaining += "."
+                await tts_queue.put(remaining)
+
+            # Signal TTS worker to finish
+            await tts_queue.put(None)
+
+            # Emit final_text immediately (don't wait for TTS to finish)
+            full_text = "".join(full_text_parts).strip()
+            if full_text:
+                yield f"event: final_text\ndata: {json.dumps(full_text, ensure_ascii=True)}\n\n".encode()
+
+            # Phase 2: Drain remaining audio from TTS worker
+            while True:
+                item = await audio_queue.get()
+                if item is None:
+                    break
+                yield item
+
+            await tts_task
+            yield f"event: done\ndata: {json.dumps({'ok': True, 'request_id': request_id}, ensure_ascii=True)}\n\n".encode()
+
+        return StreamingResponse(tts_stream(), media_type="text/event-stream")
+
+    return StreamingResponse(stream, media_type=media_type)
 
 
 @router.websocket("/ws")
@@ -159,6 +368,7 @@ async def stream_agent_ws(
     knowledge_top_k = 3
     access_level = None
     output_audio = True
+    tts_provider = None
     tts_voice = None
     tts_format = None
     tts_emotion = None
@@ -174,6 +384,7 @@ async def stream_agent_ws(
             await _emit_json(websocket, "done", {"ok": False, "reason": "missing_audio"})
             return
 
+        request_id = str(uuid.uuid4())
         request_body = AgentStreamRequest(
             session_id=session_id,
             input_type="audio",
@@ -191,6 +402,7 @@ async def stream_agent_ws(
             knowledge_top_k=knowledge_top_k,
             access_level=access_level,
             output_audio=output_audio,
+            tts_provider=tts_provider,
             tts_voice=tts_voice,
             tts_format=tts_format,
             tts_emotion=tts_emotion,
@@ -199,45 +411,209 @@ async def stream_agent_ws(
         interaction, route_meta = await input_router.normalize(request_body, provider)
         await _emit_json(websocket, "input", route_meta)
 
-        # --- GUARDRAIL ENFORCEMENT (same as /stream) ---
-        domain = None
-        tenant = (tenant_id or "").lower()
-        if "religious" in tenant:
-            domain = "religious"
-        elif "education" in tenant or "eduthum" in tenant:
-            domain = "education"
-        # Optionally, allow explicit domain in request_body
-        if hasattr(request_body, "domain") and request_body.domain:
-            domain = str(request_body.domain).lower()
-
-        user_text = getattr(interaction, "normalized_text", None) or ""
-        allowed, explanation = is_allowed_intent(user_text, domain)
-        if allowed != "YES":
-            if domain == "religious":
-                await _emit_json(websocket, "final_text", RELIGIOUS_FALLBACK)
-                await _emit_json(websocket, "done", {"ok": True, "guardrail": "religious", "explanation": explanation})
-            elif domain == "education":
-                await _emit_json(websocket, "final_text", EDUCATION_FALLBACK)
-                await _emit_json(websocket, "done", {"ok": True, "guardrail": "education", "explanation": explanation})
-            else:
-                await _emit_json(websocket, "final_text", "Sorry, I can't assist with that.")
-                await _emit_json(websocket, "done", {"ok": True, "guardrail": "default", "explanation": explanation})
-            audio_buffer = bytearray()
-            return
-
         if interaction is None:
             await _emit_json(websocket, "done", {"ok": False, **route_meta})
             audio_buffer = bytearray()
             return
 
-        async for event in conversation_brain.stream(
-            interaction=interaction,
-            body=request_body,
-            provider=provider,
-            tenant_id=tenant_id,
-        ):
-            await _emit_json(websocket, str(event.get("event") or "message"), event.get("data") or {})
+        explicit = request_body.domain.value if request_body.domain is not None else None
+        domain_key = resolve_agent_domain_for_routing(tenant_id, explicit)
+        if not domain_key:
+            await _emit_json(
+                websocket,
+                "done",
+                {
+                    "ok": False,
+                    "error": "domain_not_resolved",
+                    "detail": "Set `domain` in the start message or use a tenant id that maps to a domain.",
+                },
+            )
+            audio_buffer = bytearray()
+            return
 
+        json_body = _bot_json_payload(request_body, interaction)
+        try:
+            media_type, stream = await open_bot_stream_post(
+                domain_key=domain_key,
+                json_body=json_body,
+                tenant_id=tenant_id,
+                request_id=request_id,
+            )
+        except KeyError as exc:
+            await _emit_json(websocket, "done", {"ok": False, "error": "routing", "detail": str(exc)})
+            audio_buffer = bytearray()
+            return
+        except UpstreamBotHttpError as exc:
+            await _emit_json(
+                websocket,
+                "done",
+                {
+                    "ok": False,
+                    "error": "bot_http",
+                    "status": exc.status_code,
+                    "detail": exc.detail,
+                },
+            )
+            audio_buffer = bytearray()
+            return
+        except httpx.RequestError as exc:
+            await _emit_json(websocket, "done", {"ok": False, "error": "bot_transport", "detail": str(exc)})
+            audio_buffer = bytearray()
+            return
+
+        mt_lower = (media_type or "").lower()
+        is_sse = "text/event-stream" in mt_lower
+
+        raw = bytearray()
+        sse = SSEAssembler()
+        tts_tail = ""
+        audio_idx = 0
+        tts_enabled = bool(output_audio)
+        tts_error: str | None = None
+
+        async def _tts_push(text_piece: str) -> None:
+            nonlocal tts_tail, tts_enabled, audio_idx, tts_error
+            if not tts_enabled or not text_piece:
+                return
+            tts_tail += text_piece
+            chunk_words = (
+                QWEN_MAX_CHUNK_WORDS
+                if (tts_provider or "").lower() == "qwen"
+                else DEFAULT_MAX_CHUNK_WORDS
+            )
+            ready, tts_tail = sentence_buffer_service.pop_leading_speech_chunks(
+                tts_tail, max_chunk_words=chunk_words
+            )
+            for chunk in ready:
+                # Normalize text for natural speech output
+                speech_chunk = voice_text_normalizer.normalize_sentence(chunk)
+                if not speech_chunk:
+                    continue
+                try:
+                    audio_bytes, mime, voice_used, tts_req_id = await provider.synthesize_text(
+                        text=speech_chunk,
+                        language=language,
+                        voice=tts_voice,
+                        emotion=tts_emotion,
+                        request_id=None,
+                        output_format=tts_format,
+                        tts_provider=tts_provider,
+                    )
+                except Exception as exc:
+                    tts_enabled = False
+                    tts_error = str(exc)
+                    await _emit_json(
+                        websocket,
+                        "status",
+                        "Voice output unavailable right now. Continuing with text response.",
+                    )
+                    return
+
+                await _emit_json(
+                    websocket,
+                    "audio",
+                    {
+                        "index": audio_idx,
+                        "text": chunk,
+                        "request_id": tts_req_id,
+                        "voice": voice_used,
+                        "mime_type": mime,
+                        "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
+                    },
+                )
+                audio_idx += 1
+                await asyncio.sleep(0)
+
+        try:
+            async for chunk in stream:
+                raw.extend(chunk)
+                if is_sse:
+                    for ev, data in sse.feed(chunk):
+                        await _emit_json(websocket, ev, _maybe_json(data))
+                        if ev in ("text", "token", "delta") and isinstance(data, str):
+                            await _tts_push(data)
+                        elif ev in ("text", "token", "delta"):
+                            await _tts_push(json.dumps(data, ensure_ascii=True))
+        finally:
+            pass
+
+        if is_sse:
+            for ev, data in sse.drain():
+                await _emit_json(websocket, ev, _maybe_json(data))
+                if ev in ("text", "token", "delta") and isinstance(data, str):
+                    await _tts_push(data)
+
+            await _emit_json(
+                websocket,
+                "done",
+                {"ok": True, "tts_error": tts_error},
+            )
+            audio_buffer = bytearray()
+            return
+
+        # Non-SSE (e.g. application/json): parse full body
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError:
+            await _emit_json(
+                websocket,
+                "done",
+                {"ok": False, "error": "invalid_bot_payload", "detail": "expected JSON object"},
+            )
+            audio_buffer = bytearray()
+            return
+
+        text_out = (payload.get("response") or "").strip()
+        if not text_out:
+            await _emit_json(websocket, "done", {"ok": False, "error": "empty_bot_response"})
+            audio_buffer = bytearray()
+            return
+
+        await _emit_json(websocket, "final_text", text_out)
+
+        if output_audio and tts_enabled:
+            chunk_words = (
+                QWEN_MAX_CHUNK_WORDS
+                if (tts_provider or "").lower() == "qwen"
+                else DEFAULT_MAX_CHUNK_WORDS
+            )
+            for chunk in sentence_buffer_service.split_for_tts(text_out, max_chunk_words=chunk_words):
+                speech_chunk = voice_text_normalizer.normalize_sentence(chunk)
+                if not speech_chunk:
+                    continue
+                try:
+                    audio_bytes, mime, voice_used, tts_req_id = await provider.synthesize_text(
+                        text=speech_chunk,
+                        language=language,
+                        voice=tts_voice,
+                        emotion=tts_emotion,
+                        request_id=None,
+                        output_format=tts_format,
+                        tts_provider=tts_provider,
+                    )
+                except Exception as exc:
+                    tts_error = str(exc)
+                    break
+                await _emit_json(
+                    websocket,
+                    "audio",
+                    {
+                        "index": audio_idx,
+                        "text": chunk,
+                        "request_id": tts_req_id,
+                        "voice": voice_used,
+                        "mime_type": mime,
+                        "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
+                    },
+                )
+                audio_idx += 1
+                await asyncio.sleep(0)
+
+        await _emit_json(
+            websocket,
+            "done",
+            {"ok": True, "request_id": payload.get("request_id"), "tts_error": tts_error},
+        )
         audio_buffer = bytearray()
 
     await _emit_json(websocket, "ready", {"session_id": session_id})
@@ -252,9 +628,16 @@ async def stream_agent_ws(
                 sample_rate_hz = int(msg.get("sample_rate_hz") or sample_rate_hz)
                 language = str(msg.get("language") or language)
                 incoming_domain = str(msg.get("domain") or "").strip().lower()
-                selected_domain = (
-                    incoming_domain if incoming_domain in {"religious", "education"} else None
+                routed = resolve_agent_domain_for_routing(
+                    tenant_id,
+                    incoming_domain if incoming_domain else None,
                 )
+                selected_domain = None
+                if routed:
+                    try:
+                        selected_domain = AgentDomain(routed)
+                    except ValueError:
+                        selected_domain = None
                 llm_provider = msg.get("provider")
                 llm_model = msg.get("llm_model")
                 use_knowledge = bool(msg.get("use_knowledge", use_knowledge))
@@ -262,6 +645,7 @@ async def stream_agent_ws(
                 access_level = msg.get("access_level")
                 output_audio = bool(msg.get("output_audio", output_audio))
                 tts_voice = msg.get("tts_voice")
+                tts_provider = msg.get("tts_provider")
                 tts_format = msg.get("tts_format")
                 tts_emotion = msg.get("tts_emotion")
                 one_shot_http_audio = bool(msg.get("one_shot_http_audio", one_shot_http_audio))
@@ -287,7 +671,6 @@ async def stream_agent_ws(
                     continue
 
                 audio_buffer.extend(raw_chunk)
-                # Recorded-audio mode: append chunks and wait for explicit finalize.
                 buffered_ms = int((len(audio_buffer) / 2.0) / max(sample_rate_hz, 1) * 1000)
                 await _emit_json(
                     websocket,

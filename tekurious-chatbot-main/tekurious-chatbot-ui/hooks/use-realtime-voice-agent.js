@@ -454,7 +454,7 @@ export function useRealtimeVoiceAgent({
       }
 
       const minSpeechMs = 140;
-      const trailingSilenceMs = 800;
+      const trailingSilenceMs = 600;
       const preRollChunkCount = 8; // ~500ms at 1024 frames / 16kHz
       const maxTurnMs = 9000;
       const minThreshold = 0.0028;

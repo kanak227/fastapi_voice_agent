@@ -34,6 +34,54 @@ export const Sidebar = () => {
       label: 'Darshan AI',
       icon: MessageCircle,
       href: '/dashboard/ReligiousAI'
+    },
+    {
+      id: 'digital-literacy',
+      label: 'Digital Literacy',
+      icon: BookOpen,
+      href: '/dashboard/DigitalLiteracy'
+    },
+    {
+      id: 'design-thinking',
+      label: 'Design Thinking',
+      icon: Brain,
+      href: '/dashboard/DesignThinking'
+    },
+    {
+      id: 'wellbeing',
+      label: 'Well-being',
+      icon: MessageCircle,
+      href: '/dashboard/Wellbeing'
+    },
+    {
+      id: 'sustainability',
+      label: 'Sustainability',
+      icon: BookOpen,
+      href: '/dashboard/Sustainability'
+    },
+    {
+      id: 'global-citizenship',
+      label: 'Global Citizenship',
+      icon: BookOpen,
+      href: '/dashboard/GlobalCitizenship'
+    },
+    {
+      id: 'entrepreneurship',
+      label: 'Entrepreneurship',
+      icon: Brain,
+      href: '/dashboard/Entrepreneurship'
+    },
+    {
+      id: 'emotional-intelligence',
+      label: 'Emotional Intelligence',
+      icon: MessageCircle,
+      href: '/dashboard/EmotionalIntelligence'
+    },
+    {
+      id: 'financial-literacy',
+      label: 'Financial Literacy',
+      icon: BookOpen,
+      href: '/dashboard/FinancialLiteracy'
     }
   ];
 

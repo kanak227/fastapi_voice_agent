@@ -6,23 +6,30 @@ import uuid
 from typing import Any
 import json
 import uvicorn
-import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException, File, UploadFile, Form
+from fastapi import FastAPI, Request, HTTPException, File, UploadFile, Form, Header
 from langchain.output_parsers import PydanticOutputParser
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
-#from llm.gemini import get_gemini_engine
 
-from llm.dynamic_llm import get_llm_engine
+# from llm.gemini import get_gemini_engine
 
-from fastapi.responses import JSONResponse
+from llm.dynamic_llm import run_bot, run_bot_stream
+
+from fastapi.responses import JSONResponse, StreamingResponse
 from pathlib import Path
 from llm.output_parser import ParseOutput
 from llm.input import ParseInput
 from utils.common import DHOME
 from guardrails.guardrails import Guardrails
+
+from server.playground import register_playground
+
+try:
+    from google.api_core.exceptions import ResourceExhausted as _GeminiResourceExhausted
+except Exception:  # pragma: no cover
+    _GeminiResourceExhausted = None
 
 
 def _load_env():
@@ -32,14 +39,10 @@ def _load_env():
 
 _load_env()
 
-#For speech-to-speech POC
-try:
-    # Optional dependency chain (Azure Speech + Azure OpenAI). Keep the service
-    # runnable even if these packages aren't installed.
-    from server.s2s import run_s2s  # type: ignore
-except Exception:
-    run_s2s = None
-import threading
+log = logging.getLogger("education-ai.chat")
+
+# For speech-to-speech POC
+
 
 malicious_pattern = re.compile(r"\$\(\s*(\w+)\s*.*?\)")
 
@@ -86,6 +89,22 @@ def validate_data(data_dict, request_type):
     
     return True, "valid"
 
+
+def _wants_event_stream(accept: str | None) -> bool:
+    if not accept:
+        return False
+    lower = accept.lower()
+    return "text/event-stream" in lower or "*/*" in lower
+
+
+def _sse(event: str, data_obj: Any) -> bytes:
+    if isinstance(data_obj, (dict, list)):
+        payload = json.dumps(data_obj, ensure_ascii=True)
+    else:
+        payload = json.dumps(str(data_obj), ensure_ascii=True)
+    return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
+
+
 def get_llm_response(query: str) -> ParseOutput:
     llm_engine = get_llm_engine()
     prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "analyze_query.yaml"
@@ -122,6 +141,8 @@ def get_llm_response(query: str ) -> ParseOutput:
 
 app = FastAPI()
 
+register_playground(app, "Tekurious Education - CBSE (standalone)")
+
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -130,7 +151,7 @@ async def root():
     return {
         "status": "ok",
         "service": "tekurious-ai",
-        "endpoints": {"chat": "/chat", "docs": "/docs", "health": "/health"},
+        "endpoints": {"chat": "/chat", "playground": "/playground", "docs": "/docs", "health": "/health"},
     }
 
 
@@ -144,10 +165,16 @@ async def favicon():
     return JSONResponse(status_code=204, content=None)
 
 @app.post("/chat")
-async def chat(request: Request):
-    start_datetime = datetime.now()
+async def chat(request: Request, accept: str | None = Header(default=None)):
+    request_id = (request.headers.get("x-request-id") or "").strip() or str(uuid.uuid4())
+    tenant_id = (request.headers.get("x-tenant-id") or "").strip()
     try:
-        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        expected = (os.getenv("SERVICE_TOKEN") or "").strip()
+        if expected:
+            offered = (request.headers.get("x-service-token") or "").strip()
+            if offered != expected:
+                raise HTTPException(status_code=403, detail="Invalid or missing service token")
+
         # Support both:
         # - POST /chat?query=...
         # - POST /chat with JSON body {"query": "..."}
@@ -156,36 +183,102 @@ async def chat(request: Request):
             try:
                 body = await request.json()
                 if isinstance(body, dict) and "query" in body:
-                    data_dict = {"query": body.get("query")}
+                    data_dict = {
+                        "query": body.get("query"),
+                        "history": body.get("history", []),
+                        "input_type": body.get("input_type", "text"),
+                        "language": body.get("language", "en-US"),
+                    }
             except Exception:
                 pass
-        
+
         if is_malicious(data_dict):
-            print(f"Malicious payload detected: {data_dict}")
+            log.warning(
+                "malicious_payload request_id=%s tenant_id=%s data=%s",
+                request_id,
+                tenant_id,
+                data_dict,
+            )
             raise HTTPException(status_code=400, detail="Malicious payload detected")
 
         val_status, msg = validate_data(data_dict, "chat")
         if not val_status:
-            msg = "ERR-101" + ":" + msg
-            print(msg)
-            raise HTTPException(status_code=404, detail=msg)
+            log.info("validation_failed request_id=%s tenant_id=%s msg=%s", request_id, tenant_id, msg)
+            raise HTTPException(status_code=404, detail="ERR-101:" + msg)
 
         query = data_dict["query"]
 
-        # applying input guardrails
-        guardrails = Guardrails()
-        guardrails_output, exp = guardrails.apply_input_guardrails(query)
-        if guardrails_output !="YES":
-            return {"response": "Sorry, I can't respond. I can only help with Class 9 and Class 10 CBSE topics."}
+        history = data_dict.get("history", [])
 
-        result = get_llm_response(query)
-        response = _compact_education_response(result.output)
+        guardrails = Guardrails()
+        input_type = data_dict.get("input_type", "text")
+        is_voice = input_type in ("voice", "audio")
+
+        if is_voice:
+            guardrails_output = "YES"
+            exp = "Voice input — frontend guardrail already passed"
+        else:
+            try:
+                guardrails_output, exp = guardrails.apply_input_guardrails(query, history)
+            except Exception as e:
+                log.warning("guardrails_failed request_id=%s error=%s", request_id, str(e))
+                guardrails_output = "YES"
+                exp = "Guardrails failed, allowing query"
+        
+        if not guardrails_output or guardrails_output.strip().upper() != "YES":
+            refusal = "Sorry, I can't respond. I can only help with Class 9 and Class 10 CBSE topics."
+            if _wants_event_stream(accept):
+
+                async def refuse_stream():
+                    yield _sse("text", refusal)
+                    yield _sse("done", {"ok": True, "request_id": request_id})
+
+                return StreamingResponse(refuse_stream(), media_type="text/event-stream")
+            return {"response": refusal, "request_id": request_id}
+
+        domain_label = "Class 9 and Class 10 CBSE"
+        response_language = data_dict.get("language", "en-US") or "en-US"
+
+        if _wants_event_stream(accept):
+
+            async def event_stream():
+                try:
+                    async for piece in run_bot_stream(
+                        query=query,
+                        domain=domain_label,
+                        request_id=request_id,
+                        tenant_id=tenant_id,
+                        history=history,
+                        is_voice=is_voice,
+                        response_language=response_language,
+                    ):
+                        yield _sse("text", piece)
+                    yield _sse("done", {"ok": True, "request_id": request_id})
+                except Exception:
+                    log.exception("chat_stream_failed request_id=%s", request_id)
+                    yield _sse(
+                        "done",
+                        {"ok": False, "request_id": request_id, "detail": "stream_failed"},
+                    )
+
+            return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+        response = run_bot(
+            query=query,
+            domain=domain_label,
+            request_id=request_id,
+            tenant_id=tenant_id,
+            history=history,
+            is_voice=is_voice,
+            response_language=response_language,
+        )
+        log.info("chat_ok request_id=%s tenant_id=%s", request_id, tenant_id)
         return {"response": response, "request_id": request_id}
     except HTTPException as err:
         raise err
     except (ValueError, ImportError) as e:
         err_text = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-        logger.error("request_id=%s /chat failed: %s", request_id, err_text)
+        log.error("chat_failed request_id=%s tenant_id=%s error=%s", request_id, tenant_id, err_text)
         return JSONResponse(
             status_code=500,
             content={
@@ -195,8 +288,22 @@ async def chat(request: Request):
             },
         )
     except Exception as e:
+        if _GeminiResourceExhausted is not None and isinstance(e, _GeminiResourceExhausted):
+            log.warning("gemini_quota request_id=%s tenant_id=%s", request_id, tenant_id)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "message": (
+                        "Gemini API quota exceeded or billing required for this model. "
+                        "Use another key, enable billing, try a different GEMINI_MODEL, or retry later."
+                    ),
+                    "request_id": request_id,
+                    "type": "llm_quota",
+                },
+            )
         err_text = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-        logger.error("request_id=%s /chat crashed: %s", request_id, err_text)
+        log.error("chat_crashed request_id=%s tenant_id=%s error=%s", request_id, tenant_id, err_text)
         return JSONResponse(
             status_code=500,
             content={
@@ -205,22 +312,7 @@ async def chat(request: Request):
                 "request_id": request_id,
             },
         )
-#speech-to-speech POC
-@app.post("/s2s")
-def s2s_chat():
-    if run_s2s is None:
-        return JSONResponse(
-            status_code=501,
-            content={
-                "status": "S2S is not available",
-                "message": "Optional speech-to-speech dependencies are not installed.",
-            },
-        )
 
-    thread = threading.Thread(target=run_s2s)
-    thread.start()
-    return {"status": "S2S session started in the background."}
-    
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))

@@ -37,9 +37,9 @@ GEMINI_BASE_URL: str = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.
 GEMINI_MODEL: str | None = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
 GEMINI_TIMEOUT_SECONDS: float = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "18"))
 GEMINI_MAX_OUTPUT_TOKENS: int = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "192"))
-GEMINI_VOICE_MAX_OUTPUT_TOKENS: int = int(os.getenv("GEMINI_VOICE_MAX_OUTPUT_TOKENS", "80"))
+GEMINI_VOICE_MAX_OUTPUT_TOKENS: int = int(os.getenv("GEMINI_VOICE_MAX_OUTPUT_TOKENS", "512"))
 GEMINI_TOP_P: float = float(os.getenv("GEMINI_TOP_P", "0.8"))
-HTTP_CLIENT_TIMEOUT_SECONDS: float = float(os.getenv("HTTP_CLIENT_TIMEOUT_SECONDS", "12"))
+HTTP_CLIENT_TIMEOUT_SECONDS: float = float(os.getenv("HTTP_CLIENT_TIMEOUT_SECONDS", "60"))
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "sqlite:///./bot.db").strip()
 
@@ -62,6 +62,13 @@ ELEVENLABS_API_KEY: str | None = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_BASE_URL: str = os.getenv("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io/v1")
 ELEVENLABS_VOICE_ID: str | None = os.getenv("ELEVENLABS_VOICE_ID")
 ELEVENLABS_MODEL_ID: str = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+
+# Self-hosted Qwen3 + MMS TTS service (ElevenLabs-compatible API).
+# When the dashboard sends tts_provider="qwen" we route to this base URL
+# and use QWEN_TTS_DEFAULT_VOICE_ID instead of the ElevenLabs voice id.
+QWEN_TTS_BASE_URL: str = os.getenv("QWEN_TTS_BASE_URL", "").strip().rstrip("/")
+QWEN_TTS_API_KEY: str | None = os.getenv("QWEN_TTS_API_KEY")
+QWEN_TTS_DEFAULT_VOICE_ID: str = os.getenv("QWEN_TTS_DEFAULT_VOICE_ID", "serena")
 
 USE_DEEPGRAM_ELEVENLABS: bool = os.getenv(
     "USE_DEEPGRAM_ELEVENLABS", "false"

@@ -42,7 +42,7 @@ export function VoiceOrb({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      title={title || (listening ? 'Stop and send' : 'Voice input')}
+      title={title || (listening ? 'Stop and send' : speaking ? 'Stop speaking' : 'Voice input')}
       className={shell}
     >
       {processing && (
@@ -53,9 +53,11 @@ export function VoiceOrb({
       )}
       {listening ? (
         <Square className="relative h-4 w-4 fill-white text-white" />
+      ) : speaking ? (
+        <Square className="relative h-4 w-4 fill-white text-white" />
       ) : !processing ? (
         <Mic
-          className={`relative h-5 w-5 ${speaking ? 'text-white' : 'text-zinc-600'}`}
+          className={`relative h-5 w-5 text-zinc-600`}
         />
       ) : null}
       <span className="sr-only">

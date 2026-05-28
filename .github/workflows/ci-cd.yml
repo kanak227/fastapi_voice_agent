@@ -1,32 +1,78 @@
-name: CI/CD Pipeline
+name: CI/CD — Google Cloud Run
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+env:
+  GCP_REGION: us-central1
+  ARTIFACT_REGISTRY: us-central1-docker.pkg.dev
 
 jobs:
-  build-test:
+  # ── Lint & Test ──────────────────────────────────────────────────────────────
+  test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-      - name: Install dependencies
+          python-version: '3.12'
+
+      - name: Install gateway deps
         run: |
-          python -m pip install --upgrade pip
+          pip install --upgrade pip
           pip install -r fastapi_server/requirements.txt
-      - name: Lint
+
+      - name: Lint gateway
         run: |
           pip install flake8
-          flake8 fastapi_server/app
-      - name: Test
+          flake8 fastapi_server/app --max-line-length=120 --ignore=E501,W503
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: tekurious-chatbot-main/tekurious-chatbot-ui/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: tekurious-chatbot-main/tekurious-chatbot-ui
+        run: npm ci
+
+      - name: Lint frontend
+        working-directory: tekurious-chatbot-main/tekurious-chatbot-ui
+        run: npm run lint --if-present
+
+  # ── Deploy to Cloud Run (main branch only) ───────────────────────────────────
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    permissions:
+      contents: read
+      id-token: write  # For Workload Identity Federation
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Submit Cloud Build
         run: |
-          pip install pytest
-          pytest fastapi_server/tests
-      - name: Build Docker image
-        run: |
-          docker build -t fastapi-server:ci fastapi_server/
+          gcloud builds submit \
+            --config=deployment/gcp/cloudbuild.yaml \
+            --substitutions=SHORT_SHA=${GITHUB_SHA::8},_REGION=${{ env.GCP_REGION }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --no-source

@@ -1,113 +1,119 @@
-# Deploy: Vercel (frontend) + AWS Docker (FastAPI)
+# Deployment Guide — Google Cloud Run
 
-This matches the layout under `deployment/aws/` and `tekurious-chatbot-main/vercel.json`.
+## Architecture (merged backend)
 
-## Prerequisites
+Two Cloud Run services. The gateway and all 10 domain bots run inside a
+single container so there's only one always-on process to pay for.
 
-- **Git** repo pushed to GitHub/GitLab/Bitbucket (Vercel imports from Git).
-- **AWS CLI** configured (`aws configure`) for Docker/ECR/ECS steps.
-- **Docker Desktop** running for image builds.
-
----
-
-## 1. Frontend → Vercel
-
-### Recommended: Root directory = Next.js app
-
-1. In [Vercel](https://vercel.com) → **Add New…** → **Project** → import your repository.
-2. **Root Directory**: set to  
-   `tekurious-chatbot-main/tekurious-chatbot-ui`  
-   (if your repo root is the `MAIN` folder; if the repo is only `tekurious-chatbot-main`, use `tekurious-chatbot-ui`).
-3. Framework preset: **Next.js** (auto-detected).
-4. **Environment variables** (Production — and Preview if you want):
-
-| Name | Example | Purpose |
-|------|---------|---------|
-| `TEKURIOUS_FASTAPI_URL` | `https://api.example.com` or `http://1.2.3.4:8001` | Primary backend URL (no trailing slash). |
-| `FASTAPI_TENANT_ID` | `tenant-demo` | Tenant header for FastAPI. |
-
-Optional fallbacks (same URL is fine): `TEKURIOUS_AI_BASE_URL`, `EDUTHUM_BASE_URL`, `FASTAPI_BASE_URL`, `FASTAPI_VOICE_BASE_URL`.
-
-5. **Deploy**.
-
-### Alternative: Monorepo Git root = `tekurious-chatbot-main` (leave Vercel “Root Directory” empty)
-
-Use this when the connected Git folder is the monorepo and you do **not** set Vercel’s Root Directory to `tekurious-chatbot-ui`.
-
-Repo `vercel.json` installs and builds **only** under `tekurious-chatbot-ui` (one `npm ci`, one lockfile — same as a normal Next app). The small **root** `package.json` only lists `next` / `react` / `react-dom` so Vercel’s framework check passes (it reads the repo root manifest).
-
-**Commit** `tekurious-chatbot-ui/package-lock.json`. Do **not** add a root `package-lock.json` (avoids duplicate-lockfile noise).
-
-**CLI from monorepo root:** `npx vercel deploy --prod`
-
-**CLI when the linked project uses the UI folder:**  
-`npx vercel deploy --prod --cwd tekurious-chatbot-ui`
-
----
-
-## 2. FastAPI → Docker → AWS (ECR + ECS)
-
-### What the repo already provides
-
-| Item | Path |
-|------|------|
-| Dockerfile | `fastapi_server/Dockerfile` (listens on **8001**) |
-| Push all service images | `deployment/aws/push-images.ps1` |
-| Build + push + redeploy FastAPI only | `deployment/aws/redeploy-fastapi.ps1` |
-| ECS task definition template | `deployment/aws/task-definitions/fastapi-server.task.json` |
-| Full AWS checklist | `deployment/aws/deploy-checklist.md` |
-| Short overview | `deployment/aws/README.md` |
-
-### One-command FastAPI redeploy (typical)
-
-From a PowerShell prompt on your machine (adjust paths if your clone is not `c:\New folder (6)\MAIN`):
-
-```powershell
-cd "c:\New folder (6)\MAIN\deployment\aws"
-.\redeploy-fastapi.ps1 -AccountId YOUR_12_DIGIT_AWS_ACCOUNT_ID -Region us-east-1 -Cluster tekurious-prod -Service fastapi-server
+```
+Internet
+   │
+   ├── chatbot-frontend  (Next.js, port 3000, scale-to-zero)
+   │        │
+   │        └── multi-bot-server  (gateway + 10 bots, port 8080, min=1)
+   │                  │
+   │                  ├─ FastAPI gateway routes:  /agent/*, /voice/*, /health, ...
+   │                  └─ 10 bot subprocesses:     127.0.0.1:8001..8010
 ```
 
-Parameters:
+Bot subprocesses are reached over loopback (no network hop, no auth).
+The merged container is the only place that needs to stay warm.
 
-- **`-AccountId`** — required; `aws sts get-caller-identity --query Account --output text`
-- **`-Region`** — default `us-east-1`
-- **`-Cluster` / `-Service`** — must match your ECS cluster and service name
+## Cost
 
-The script builds `fastapi_server`, pushes to ECR `fastapi-server:<tag>`, registers a new task definition, and forces a new deployment.
+| Service | Resources | Monthly cost |
+|---|---|---|
+| `multi-bot-server` (merged) | 2 vCPU, 3 GiB, min=1 | ~$33 |
+| `chatbot-frontend` | 1 vCPU, 0.5 GiB, min=0 | ~$0-5 |
+| Artifact Registry, secrets, egress | | ~$2-5 |
 
-**Note:** Scripts default to `$RepoRoot = "c:/New folder (6)/MAIN"`. If your repo lives elsewhere, edit `RepoRoot` in `redeploy-fastapi.ps1` and `push-images.ps1`.
+**Idle baseline: ~$33-43/month.** Plus per-request CPU during real traffic
+(usually +$5-15). Free tier of 2M requests / 360k vCPU-seconds covers
+moderate traffic for free.
 
-### Push all four images (optional)
+## Quick start
 
-```powershell
-.\push-images.ps1 -AccountId YOUR_ACCOUNT_ID -Region us-east-1 -Tag v2026-03-29-1
+### 1. One-time setup
+
+```bash
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+cd deployment/gcp
+chmod +x setup.sh
+./setup.sh
 ```
 
-Builds: `chatbot-frontend`, `fastapi-server`, `religious-bot`, `education-bot`.
+This enables APIs, creates the Artifact Registry repo, and provisions
+secrets in Secret Manager.
 
-### Get FastAPI base URL for Vercel
+### 2. Deploy
 
-After ECS is running:
-
-```powershell
-.\print-fastapi-vercel-env.ps1 -Region us-east-1 -Cluster tekurious-prod -Service fastapi-server
+```bash
+gcloud builds submit \
+  --config=deployment/gcp/cloudbuild.yaml \
+  --substitutions=SHORT_SHA=$(git rev-parse --short HEAD),_REGION=us-central1 \
+  --project=YOUR_PROJECT_ID
 ```
 
-Copy the printed `TEKURIOUS_FASTAPI_URL` value into Vercel → Environment Variables → Production → **Redeploy** the frontend.
+Or wire the Cloud Build trigger to your GitHub repo (push to `main` →
+auto-deploy).
 
----
+### 3. Service URLs
 
-## 3. Production details
+```bash
+gcloud run services describe chatbot-frontend \
+  --region=us-central1 --format='value(status.url)'
+gcloud run services describe multi-bot-server \
+  --region=us-central1 --format='value(status.url)'
+```
 
-- **Port:** Docker/ECS use **8001** for FastAPI. Local dev may use **8010**; set Vercel to whatever URL/port your deployed API exposes (often **443** behind HTTPS, not `:8001` in the public URL).
-- **CORS:** Default `CORS_ALLOW_ORIGINS=*` with `allow_credentials=false` (valid for `*`). For browser credentialed calls from a fixed origin, set `CORS_ALLOW_ORIGINS=https://your-app.vercel.app` and optionally `CORS_ALLOW_CREDENTIALS=true`.
-- **Vercel uploads:** `app/api/Eduthum/route.js` caps PDF size at **4 MB** when `VERCEL=1` (platform body limits). For larger files, use direct-to-S3 uploads or a non-serverless path.
-- **Secrets:** Prefer AWS Secrets Manager for API keys (see `fastapi-server.task.json` `secrets` block).
-- **Stable URL:** For production, use an **ALB + HTTPS** (see `deploy-checklist.md`) instead of relying on changing task public IPs.
+## Environment
 
----
+### Secrets (Secret Manager)
 
-## 4. Quick validation
+| Secret | Used by |
+|---|---|
+| `GEMINI_API_KEY`, `GOOGLE_API_KEY` | LLM calls |
+| `DEEPGRAM_API_KEY` | STT |
+| `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | Online TTS |
+| `QDRANT_URL`, `QDRANT_API_KEY` | Vector store |
+| `REDIS_URL` | Short-term memory + retrieval cache |
 
-- Backend: `GET https://<your-api-host>/health` (or `http://<ip>:8001/health`).
-- Frontend: open the Vercel URL and send a chat message; confirm network calls hit your FastAPI host.
+Future (when GPU TTS comes online):
+
+| Secret | Notes |
+|---|---|
+| `QWEN_TTS_BASE_URL` | Compute Engine VM URL, e.g. `http://1.2.3.4:8000/v1` |
+| `QWEN_TTS_API_KEY` | Optional shared secret |
+
+### Plain env vars (set in cloudbuild.yaml)
+
+`LLM_PROVIDER=gemini`, `GEMINI_MODEL=gemini-2.0-flash`,
+`FASTAPI_TENANT_ID=tenant-demo`, `ENV=production`. The merged container
+sets `DOMAIN_MAP_JSON` to loopback URLs automatically — no override needed.
+
+## Local development
+
+```bash
+# All bots + gateway in one process (mirrors production)
+cd tekurious-chatbot-main/bots
+PYTHONPATH=../../fastapi_server:. python multi_bot_server/merged_main.py
+
+# Frontend (separate terminal)
+cd tekurious-chatbot-main/tekurious-chatbot-ui
+npm run dev
+```
+
+Or, for finer-grained dev with hot reload, run the gateway and bots as
+separate uvicorn processes (`scripts/start_local_domain_bots.ps1`).
+
+## Updating secrets
+
+```bash
+# Add a new version
+echo -n "new-value" | gcloud secrets versions add SECRET_NAME --data-file=-
+
+# Redeploy to pick it up (Cloud Run pins to the version at deploy time)
+gcloud run services update multi-bot-server --region=us-central1 \
+  --update-labels=secret-rev=$(date +%s)
+```

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import os
+
 from app.core import config
 
 
 def validate_configuration() -> None:
     """Fail fast on invalid or incomplete configuration."""
+
+    # Thin BFF / proxy gateway: no gateway-side LLM keys required (bots own LLM/RAG).
+    if os.getenv("GATEWAY_MODE", "").strip().lower() in {"thin", "bff", "proxy"}:
+        return
 
     llm_provider = (config.LLM_PROVIDER or "").strip().lower()
     llm_model = (config.LLM_MODEL or None)

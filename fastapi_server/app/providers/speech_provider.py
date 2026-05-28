@@ -51,6 +51,7 @@ class SpeechProvider(ABC):
         emotion: Optional[str] = None,
         request_id: Optional[str] = None,
         output_format: Optional[str] = None,
+        tts_provider: Optional[str] = None,
     ) -> tuple[bytes, str, str | None, str]:
         """Text-to-speech.
 

@@ -81,10 +81,23 @@ async def transcribe_audio(
 
 @router.get("/voices", response_model=list[VoiceInfo])
 async def list_voices(
+    tts_provider: str | None = None,
+    language: str | None = None,
     provider: SpeechProvider = Depends(get_speech_provider),
 ) -> list[VoiceInfo]:
+    """List voices for a TTS backend.
+
+    `tts_provider=elevenlabs` (default) → ElevenLabs cloud voices.
+    `tts_provider=qwen` → voices from the self-hosted Qwen3 + MMS service.
+    `language` (optional) → filter voices by language base code.
+    """
+    backend = (tts_provider or "elevenlabs").strip().lower()
+    voices: list[dict] = []
     try:
-        voices = await provider.list_voices()
+        if backend == "qwen" and hasattr(provider, "list_voices_qwen"):
+            voices = await provider.list_voices_qwen(language=language)
+        else:
+            voices = await provider.list_voices(language=language)
     except NotImplementedError:
         return []
     except Exception:
@@ -102,22 +115,36 @@ async def synthesize(
     body: SynthesizeRequest,
     provider: SpeechProvider = Depends(get_speech_provider),
 ) -> SynthesizeResponse:
+    from app.services.voice_text_normalizer import voice_text_normalizer
+
     rid = body.request_id or str(uuid.uuid4())
+    # Normalize text for natural speech (strip markdown, emojis, etc.)
+    speech_text = voice_text_normalizer.normalize(body.text) or body.text
     try:
         audio_bytes, mime, voice_used, final_rid = await provider.synthesize_text(
-            text=body.text,
+            text=speech_text,
             language=body.language,
             voice=body.voice,
             emotion=body.emotion,
             request_id=rid,
             output_format=body.output_format,
+            tts_provider=body.tts_provider,
         )
     except DeepgramElevenLabsError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail="TTS request failed") from exc
+        # Surface the underlying error type+message so we can debug from
+        # Cloud Run logs without redeploying.
+        import logging
+        logging.getLogger("voice.synthesize").exception(
+            "TTS failed (provider=%s voice=%s)", body.tts_provider, body.voice
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"TTS failed: {type(exc).__name__}: {exc}",
+        ) from exc
 
     return SynthesizeResponse(
         request_id=final_rid,

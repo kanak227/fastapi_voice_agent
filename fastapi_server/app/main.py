@@ -1,13 +1,16 @@
+import logging
 import os
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 import app.models  # noqa: F401
 from app.core.config import APP_NAME, ENV
+from app.core.domain_map import DOMAIN_MAP
+from app.schemas.agent import AgentDomain, AgentDomainsResponse
 from app.core.validation import validate_configuration
 from app.core.database import Base, engine
 from app.routers.agent import router as agent_router
@@ -17,6 +20,30 @@ from app.routers.documents import router as documents_router
 from app.routers.knowledge import router as knowledge_router
 from app.services.runtime_clients import runtime_clients
 from app.services.retrieval_cache_service import retrieval_cache_service
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+
+def live_agent_domains() -> AgentDomainsResponse:
+    """
+    Domains advertised to clients: intersection of the AgentDomain enum and active DOMAIN_MAP
+    (from DOMAIN_MAP_JSON at startup or defaults). Never lists a slug without a routable URL.
+    """
+    routable = set(DOMAIN_MAP.keys())
+    vals = sorted(m.value for m in AgentDomain if m.value in routable)
+    return AgentDomainsResponse(domains=vals, count=len(vals))
+
+
+def live_agent_domains_json() -> JSONResponse:
+    payload = live_agent_domains()
+    return JSONResponse(
+        content=payload.model_dump(),
+        media_type="application/json; charset=utf-8",
+    )
+
 
 def create_app() -> FastAPI:
     validate_configuration()
@@ -53,6 +80,10 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    from app.middleware.request_id import RequestIdMiddleware
+
+    application.add_middleware(RequestIdMiddleware)
+
     # Routers
 
     from app.routers.health import router as health_router
@@ -62,6 +93,35 @@ def create_app() -> FastAPI:
     application.include_router(documents_router)
     application.include_router(knowledge_router)
     application.include_router(health_router)
+
+    # Register here (not only on APIRouter) so these paths always match this app —
+    # avoids environments where submodule routes fail to attach.
+    application.add_api_route(
+        "/agent/domains",
+        live_agent_domains,
+        methods=["GET"],
+        response_model=AgentDomainsResponse,
+        tags=["agent"],
+        summary="Accepted agent domain ids",
+        name="diag_agent_domains",
+    )
+    application.add_api_route(
+        "/health/agent-domains",
+        live_agent_domains,
+        methods=["GET"],
+        response_model=AgentDomainsResponse,
+        tags=["health"],
+        summary="Accepted agent domain ids (health mirror)",
+        name="diag_health_agent_domains",
+    )
+    application.add_api_route(
+        "/health/agent-domains.json",
+        live_agent_domains_json,
+        methods=["GET"],
+        tags=["health"],
+        summary="Same as /health/agent-domains with explicit JSON media type",
+        name="diag_health_agent_domains_json",
+    )
 
     @application.get("/")
     def ui_home():

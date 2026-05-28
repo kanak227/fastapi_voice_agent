@@ -19,7 +19,7 @@ class NormalizedInteractionInput(BaseModel):
     # Pointer to original input (e.g., blob url, recording id, request id)
     raw_input_ref: Optional[str] = None
 
-    # Text to feed the orchestrator/LLM layer
+    # Normalized user text for downstream domain bots (via BFF proxy)
     normalized_text: str = Field("", description="Normalized text representation")
 
     language: Optional[str] = None

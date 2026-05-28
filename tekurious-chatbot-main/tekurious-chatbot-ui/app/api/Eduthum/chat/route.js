@@ -7,16 +7,20 @@ import {
 } from "@/lib/domain-guardrails";
 import { createParser } from "../../eventsource-parser.js";
 import {
+  attachAgentDomainPayloadField,
   getFastApiBaseUrl,
-  getFastApiTenantId,
+  getFastApiTenantIdForAgentDomain,
 } from "@/lib/fastapi-backend";
+
+const DOMAIN_SLUG = "education";
 
 export async function POST(request) {
   try {
     const body = await request.json();
-    const { query, session_id } = body;
+    const { query, session_id, history, language } = body;
     const normalizedQuery = String(query || "").trim();
     const sid = session_id || `education-${Date.now()}`;
+    const lang = language || "en-US";
 
     if (!normalizedQuery) {
       return NextResponse.json(
@@ -36,18 +40,24 @@ export async function POST(request) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Tenant-Id": getFastApiTenantId(),
+        "X-Tenant-Id": getFastApiTenantIdForAgentDomain(DOMAIN_SLUG),
       },
-      body: JSON.stringify({
-        session_id: sid,
-        input_type: "text",
-        text: normalizedQuery,
-        domain: "education",
-        language: "en-US",
-        output_audio: false,
-        use_knowledge: true,
-        knowledge_top_k: 3,
-      }),
+      body: JSON.stringify(
+        attachAgentDomainPayloadField(
+          {
+            session_id: sid,
+            input_type: "text",
+            text: normalizedQuery,
+            domain: DOMAIN_SLUG,
+            language: lang,
+            output_audio: false,
+            use_knowledge: true,
+            knowledge_top_k: 3,
+            history: history || [],
+          },
+          DOMAIN_SLUG
+        )
+      ),
     });
 
     if (!response.ok) {

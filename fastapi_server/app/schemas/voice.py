@@ -70,6 +70,7 @@ class TranscribeAudioRequest(BaseModel):
 
 class VoiceInfo(BaseModel):
     name: str
+    voice_id: str | None = None
     locale: str | None = None
     gender: str | None = None
     provider: str | None = None
@@ -84,6 +85,10 @@ class SynthesizeRequest(BaseModel):
     output_format: str | None = Field(
         None,
         description="Optional provider format hint, e.g. mp3 or wav",
+    )
+    tts_provider: str | None = Field(
+        None,
+        description='Force a TTS backend: "elevenlabs" (default) or "qwen" (self-hosted).',
     )
 
 

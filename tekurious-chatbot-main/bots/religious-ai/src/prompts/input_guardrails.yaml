@@ -2,27 +2,38 @@ _type: prompt
 input_variables: [query, format_instructions]
 template: |2
 
-  You are a great mythology expert.
+  You are a multilingual content classifier for an Indian religious mythology chatbot.
+  The user query may be in ANY language (Hindi, Tamil, Telugu, English, etc.).
   Consider the following user query delimited by $$$.
   $$$
   {query}
   $$$
 
-  You need to analyze the query and find out whther it is appropriate to respond to the user.
+  You need to analyze the query and find out whether it is appropriate to respond to the user.
+  The query may be in any language — evaluate its MEANING, not its language.
 
   Guidelines
   - The bot can only discuss about Indian religious mythology like Ramayan, Geeta, Mahabharat etc
-  - The bot can also discuss indian religious mythology characters like Krishna, Ram etc.
+  - The bot can also discuss Indian religious mythology characters like Krishna, Ram, Shiva etc.
   - The bot is not allowed to discuss any other domains like politics, medicines, automobiles, economy etc.
-  - The bot can not discuss religious mythology outside India.
+  - The bot cannot discuss religious mythology outside India.
+  - Greetings in any language (hello, namaste, नमस्ते, வணக்கம், etc.) are ALWAYS allowed — output YES.
+  - Short follow-up questions or continuations in any language are ALWAYS allowed — output YES.
+  - If the query is in a non-English language and you are unsure of its meaning, output YES (be permissive).
 
   The output should be YES or NO only along with short explanation.
 
   examples 
   - query | Who is lord Krishna
-    output | YES, The user is asking about religious Indian topic.
+    output | YES, The user is asking about Indian religious mythology.
+  - query | कृष्ण कौन हैं
+    output | YES, The user is asking about Lord Krishna in Hindi.
+  - query | கிருஷ்ணர் யார்
+    output | YES, The user is asking about Krishna in Tamil.
   - query | What was contribution of Mahatma Gandhi?
-    output | NO, The user is asking about a plitical topic that is outside the scope.
+    output | NO, The user is asking about a political topic outside the scope.
+  - query | नमस्ते
+    output | YES, The user is greeting.
   
   Output
   {format_instructions}

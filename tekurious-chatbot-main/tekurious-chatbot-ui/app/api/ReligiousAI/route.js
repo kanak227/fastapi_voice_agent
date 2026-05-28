@@ -7,9 +7,12 @@ import {
 } from "@/lib/domain-guardrails";
 import { createParser } from "../eventsource-parser.js";
 import {
+  attachAgentDomainPayloadField,
   getFastApiBaseUrl,
-  getFastApiTenantId,
+  getFastApiTenantIdForAgentDomain,
 } from "@/lib/fastapi-backend";
+
+const DOMAIN_SLUG = "religious";
 
 export async function POST(request) {
   let body;
@@ -18,9 +21,10 @@ export async function POST(request) {
   } catch {
     return NextResponse.json({ response: "Invalid JSON body." }, { status: 400 });
   }
-  const { query, session_id } = body;
+  const { query, session_id, history, language } = body;
   const normalizedQuery = String(query ?? "").trim();
   const sid = session_id || `religious-${Date.now()}`;
+  const lang = language || "en-US";
 
   if (!isReligiousTopicAllowedByIntent(normalizedQuery)) {
     return NextResponse.json({ response: RELIGIOUS_FALLBACK });
@@ -35,18 +39,24 @@ export async function POST(request) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Tenant-Id": getFastApiTenantId(),
+        "X-Tenant-Id": getFastApiTenantIdForAgentDomain(DOMAIN_SLUG),
       },
-      body: JSON.stringify({
-        session_id: sid,
-        input_type: "text",
-        text: normalizedQuery,
-        domain: "religious",
-        language: "en-US",
-        output_audio: false,
-        use_knowledge: true,
-        knowledge_top_k: 3,
-      }),
+      body: JSON.stringify(
+        attachAgentDomainPayloadField(
+          {
+            session_id: sid,
+            input_type: "text",
+            text: normalizedQuery,
+            domain: DOMAIN_SLUG,
+            language: lang,
+            output_audio: false,
+            use_knowledge: true,
+            knowledge_top_k: 3,
+            history: history || [],
+          },
+          DOMAIN_SLUG
+        )
+      ),
     });
   } catch {
     return NextResponse.json(

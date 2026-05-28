@@ -1,0 +1,12 @@
+# Cloud Build uses .gcloudignore (not .dockerignore) for `gcloud builds submit`.
+# Keep the build context small.
+venv/
+.venv/
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+*.wav
+*.mp3
+.DS_Store
+*.log
