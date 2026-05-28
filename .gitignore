@@ -53,3 +53,9 @@ vercel.json
 
 # Nested git backups
 .nested-git-backup/
+
+# Salesforce DX and Kiro IDE files
+.sfdx/
+.kiro/
+**/.sfdx/
+**/.kiro/
