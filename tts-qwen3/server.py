@@ -393,22 +393,11 @@ def health() -> dict:
 @app.get("/v1/voices")
 def list_voices(
     xi_api_key: Optional[str] = Header(default=None, alias="xi-api-key"),
-    language: Optional[str] = Query(default=None),
 ):
     _check_auth(xi_api_key)
     
-    # If no language filter, return all voices (backward compatible)
-    if not language:
-        return {"voices": VOICE_CATALOG}
-    
-    # Filter voices by language base code
-    language_base = language.strip().lower().split("-")[0]
-    filtered_voices = [
-        voice for voice in VOICE_CATALOG
-        if language_base in voice.get("languages", [])
-    ]
-    
-    return {"voices": filtered_voices}
+    # Return all voices - client will filter by language if needed
+    return {"voices": VOICE_CATALOG}
 
 
 @app.post("/v1/text-to-speech/{voice_id}")

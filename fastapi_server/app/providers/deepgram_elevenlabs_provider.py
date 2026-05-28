@@ -183,10 +183,9 @@ class DeepgramElevenLabsProvider(SpeechProvider):
         if not config.ELEVENLABS_API_KEY:
             raise DeepgramElevenLabsError("ELEVENLABS_API_KEY is not set")
 
+        # ElevenLabs API doesn't support language filtering via query params
+        # We'll fetch all voices and filter client-side
         url = f"{config.ELEVENLABS_BASE_URL.rstrip('/')}/voices"
-        # Pass language filter to backend if provided
-        if language:
-            url = f"{url}?language={language}"
 
         async with httpx.AsyncClient(timeout=12.0) as client:
             resp = await client.get(url, headers={"xi-api-key": config.ELEVENLABS_API_KEY})
@@ -255,10 +254,9 @@ class DeepgramElevenLabsProvider(SpeechProvider):
         """Voices exposed by the self-hosted Qwen3+MMS TTS service."""
         if not config.QWEN_TTS_BASE_URL:
             return []
+        
+        # Fetch all voices from Qwen TTS service (no language filtering on backend)
         url = f"{config.QWEN_TTS_BASE_URL.rstrip('/')}/voices"
-        # Pass language filter to backend if provided
-        if language:
-            url = f"{url}?language={language}"
         
         headers: dict[str, str] = {}
         if config.QWEN_TTS_API_KEY:
@@ -297,8 +295,7 @@ class DeepgramElevenLabsProvider(SpeechProvider):
         
         filtered_out = [v for v in out if v.get("voice_id")]
         
-        # Additional client-side filtering by language if provided
-        # This handles cases where the backend doesn't filter or returns all voices
+        # Client-side filtering by language if provided
         if language:
             lang_base = language.split("-")[0].lower()
             # Filter by either locale match or languages array match
