@@ -104,7 +104,7 @@ MMS_LANG_MAP: dict[str, str] = {
 VOICE_CATALOG: list[dict] = [
     {"voice_id": "serena", "name": "Serena", "labels": {"gender": "female", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
     {"voice_id": "ethan", "name": "Ethan", "labels": {"gender": "male", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
-    {"voice_id": "mms-hindi", "name": "Hindi (MMS)", "labels": {"gender": "neutral", "accent": "hindi"}, "languages": ["hi"]},
+    {"voice_id": "mms-hindi", "name": "Hindi (MMS)", "labels": {"gender": "neutral", "accent": "hindi"}, "languages": ["hi", "hi-Latn"]},
     {"voice_id": "mms-tamil", "name": "Tamil (MMS)", "labels": {"gender": "neutral", "accent": "tamil"}, "languages": ["ta"]},
     {"voice_id": "mms-telugu", "name": "Telugu (MMS)", "labels": {"gender": "neutral", "accent": "telugu"}, "languages": ["te"]},
     {"voice_id": "mms-marathi", "name": "Marathi (MMS)", "labels": {"gender": "neutral", "accent": "marathi"}, "languages": ["mr"]},
