@@ -234,17 +234,18 @@ class DeepgramElevenLabsProvider(SpeechProvider):
             lang_base = lang_input.split("-")[0]
             
             # Filter by either locale match or languages array match
+            # If voice has no language info, include it for backward compatibility
             filtered_voices = [
                 v for v in filtered_voices
                 if (
                     # Match by locale field
                     (v.get("locale") and v["locale"].lower() == lang_base)
                     # OR match by languages array
-                    or (v.get("languages") and isinstance(v["languages"], list) and 
+                    or (v.get("languages") and isinstance(v["languages"], list) and len(v["languages"]) > 0 and
                         any(lang.lower() == lang_base or lang.lower() == lang_input 
                             for lang in v["languages"]))
-                    # OR if no locale/languages info, include it (backward compatibility)
-                    or (not v.get("locale") and not v.get("languages"))
+                    # OR if no locale/languages info, include it (backward compatibility with old servers)
+                    or (not v.get("locale") and (not v.get("languages") or len(v.get("languages", [])) == 0))
                 )
             ]
         
@@ -301,17 +302,18 @@ class DeepgramElevenLabsProvider(SpeechProvider):
             lang_base = lang_input.split("-")[0]
             
             # Filter by either locale match or languages array match
+            # If voice has no language info, include it for backward compatibility
             filtered_out = [
                 v for v in filtered_out
                 if (
                     # Match by locale field (for MMS voices with language-specific accents)
                     (v.get("locale") and v["locale"].lower() == lang_base)
                     # OR match by languages array (for multi-language voices like Serena/Ethan)
-                    or (v.get("languages") and isinstance(v["languages"], list) and 
+                    or (v.get("languages") and isinstance(v["languages"], list) and len(v["languages"]) > 0 and
                         any(lang.lower() == lang_base or lang.lower() == lang_input 
                             for lang in v["languages"]))
-                    # OR if no locale/languages info, include it (backward compatibility)
-                    or (not v.get("locale") and not v.get("languages"))
+                    # OR if no locale/languages info, include it (backward compatibility with old servers)
+                    or (not v.get("locale") and (not v.get("languages") or len(v.get("languages", [])) == 0))
                 )
             ]
         
