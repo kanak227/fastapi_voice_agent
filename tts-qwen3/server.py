@@ -181,8 +181,8 @@ def _load_models() -> None:
     logger.info("Qwen3-TTS ready. MMS engines will load on demand.")
 
 
-def _qwen_synthesize(text: str, language: str) -> tuple[np.ndarray, int]:
-    speaker = DEFAULT_VOICE_ID
+def _qwen_synthesize(text: str, language: str, speaker: str = None) -> tuple[np.ndarray, int]:
+    speaker = speaker or DEFAULT_VOICE_ID
     with app.state.qwen_lock:
         _set_seed(SEED)
         wavs, sr = app.state.qwen_model.generate_custom_voice(
@@ -435,7 +435,7 @@ def text_to_speech(
 
     try:
         if engine == "qwen":
-            audio, sr = _qwen_synthesize(text, arg)
+            audio, sr = _qwen_synthesize(text, arg, speaker=voice)
         else:
             audio, sr = _mms_synthesize(text, arg)
     except Exception as exc:
