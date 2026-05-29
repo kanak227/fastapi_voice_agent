@@ -101,6 +101,18 @@ class DeepgramElevenLabsProvider(SpeechProvider):
 
         # For Hinglish (hi-Latn), use Hindi model
         deepgram_lang = "hi" if lang == "hi-Latn" else lang
+
+        # Deepgram nova-2 expects region-qualified codes for Chinese. A bare
+        # "zh" frequently returns an empty transcript (surfaced to the user as
+        # "speech not detected"), so normalize it to Mandarin Simplified.
+        _DEEPGRAM_LANG_ALIASES = {
+            "zh": "zh-CN",
+            "zh-Hans": "zh-CN",
+            "zh-Hant": "zh-TW",
+            "cmn": "zh-CN",
+        }
+        deepgram_lang = _DEEPGRAM_LANG_ALIASES.get(deepgram_lang, deepgram_lang)
+
         # Strip region suffix for lookup (e.g. "en-US" -> "en")
         lang_base = deepgram_lang.split("-")[0].lower()
 
@@ -396,8 +408,25 @@ class DeepgramElevenLabsProvider(SpeechProvider):
         if api_key:
             headers["xi-api-key"] = api_key
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
+        # The self-hosted Qwen3 + MMS service runs on a single T4 GPU and has
+        # no streaming: it renders the whole clip before responding. A
+        # multi-sentence chunk can take 30-60s. ElevenLabs (cloud) is fast.
+        # A 20s cap here was silently turning slow Qwen renders into
+        # httpx.ReadTimeout — whose str() is empty, so it surfaced in logs as
+        # "tts_chunk_failed err=" with no message and produced no audio.
+        tts_timeout = (
+            httpx.Timeout(180.0, connect=10.0)
+            if backend_label == "qwen"
+            else httpx.Timeout(30.0, connect=10.0)
+        )
+        try:
+            async with httpx.AsyncClient(timeout=tts_timeout) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+        except httpx.TimeoutException as exc:
+            raise DeepgramElevenLabsError(
+                f"{backend_label} TTS request timed out after {tts_timeout.read}s "
+                f"(text length={len(payload.get('text', ''))})"
+            ) from exc
 
         if resp.status_code >= 400:
             raise DeepgramElevenLabsError(
