@@ -199,6 +199,15 @@ def _load_models() -> None:
     app.state.uroman = None  # lazy-init
     app.state.graphs_warmed = False
 
+    # ---- Request superseding -------------------------------------------------
+    # Every incoming TTS request claims a monotonically increasing generation
+    # number. Any synthesis already in flight checks this between chunks and
+    # ABORTS the moment a newer request arrives, then releases the GPU lock so
+    # the new request runs immediately. This guarantees the VM only ever works
+    # on the latest request and never interleaves/mixes two turns on the GPU.
+    app.state.request_seq = 0
+    app.state.seq_lock = threading.Lock()
+
     # Warm the CUDA graphs once so the first real request doesn't pay the
     # capture cost (~3-5s). Best-effort; failures fall back to lazy capture.
     try:
@@ -216,6 +225,25 @@ def _load_models() -> None:
     logger.info("FasterQwen3TTS ready. MMS engines will load on demand.")
 
 
+class RequestSuperseded(Exception):
+    """Raised when a newer TTS request arrives and this one should abort."""
+
+
+def _claim_request() -> int:
+    """Register a new request and return its generation id.
+
+    The id is the latest; any older in-flight synthesis will see a higher
+    app.state.request_seq and abort at its next chunk boundary.
+    """
+    with app.state.seq_lock:
+        app.state.request_seq += 1
+        return app.state.request_seq
+
+
+def _is_current(my_seq: int) -> bool:
+    return my_seq >= app.state.request_seq
+
+
 def _normalize_qwen_lang(language: str) -> str:
     """FasterQwen3TTS expects capitalized language names ('English')."""
     lang = (language or DEFAULT_LANGUAGE).strip()
@@ -224,16 +252,23 @@ def _normalize_qwen_lang(language: str) -> str:
     return DEFAULT_LANGUAGE[:1].upper() + DEFAULT_LANGUAGE[1:]
 
 
-def _qwen_stream(text: str, language: str, speaker: str = None):
+def _qwen_stream(text: str, language: str, speaker: str = None, my_seq: int | None = None):
     """Yield (audio_float32_mono, sample_rate) sub-chunks as the model renders.
 
     This is the realtime path: FasterQwen3TTS emits ~0.67s of audio every
     QWEN_CHUNK_SIZE steps (~680ms to first chunk on a T4), so the caller can
     forward audio to the browser while the rest is still being generated.
+
+    If ``my_seq`` is provided, the loop aborts (raising RequestSuperseded) the
+    moment a newer request has claimed a higher generation number — freeing the
+    GPU lock for the new request instead of finishing stale audio.
     """
     speaker = speaker or DEFAULT_VOICE_ID
     lang = _normalize_qwen_lang(language)
     with app.state.qwen_lock:
+        # If a newer request arrived while we waited for the lock, bail now.
+        if my_seq is not None and not _is_current(my_seq):
+            raise RequestSuperseded()
         with torch.inference_mode():
             for audio_chunk, chunk_sr, _timing in app.state.qwen_model.generate_custom_voice_streaming(
                 text=text,
@@ -241,13 +276,17 @@ def _qwen_stream(text: str, language: str, speaker: str = None):
                 speaker=speaker,
                 chunk_size=QWEN_CHUNK_SIZE,
             ):
+                if my_seq is not None and not _is_current(my_seq):
+                    # A newer request is waiting — stop generating and release
+                    # the GPU lock so it can start immediately.
+                    raise RequestSuperseded()
                 arr = audio_chunk
                 if hasattr(arr, "cpu"):
                     arr = arr.cpu().numpy()
                 yield np.asarray(arr, dtype=np.float32).reshape(-1), int(chunk_sr or 24000)
 
 
-def _qwen_synthesize(text: str, language: str, speaker: str = None) -> tuple[np.ndarray, int]:
+def _qwen_synthesize(text: str, language: str, speaker: str = None, my_seq: int | None = None) -> tuple[np.ndarray, int]:
     """Synthesize a full clip by consuming the streaming generator.
 
     Used by the non-streaming endpoint. The streaming path underneath is what
@@ -255,7 +294,7 @@ def _qwen_synthesize(text: str, language: str, speaker: str = None) -> tuple[np.
     """
     chunks: list[np.ndarray] = []
     sr = 24000
-    for arr, chunk_sr in _qwen_stream(text, language, speaker):
+    for arr, chunk_sr in _qwen_stream(text, language, speaker, my_seq=my_seq):
         sr = chunk_sr
         chunks.append(arr)
 
@@ -343,11 +382,16 @@ def _get_mms(lang_iso639_3: str):
         return cache[lang_iso639_3]
 
 
-def _mms_synthesize(text: str, lang_iso639_3: str) -> tuple[np.ndarray, int]:
-    model, tokenizer, is_uroman, lock = _get_mms(lang_iso639_3)
+def _mms_synthesize(text: str, lang_iso639_3: str, my_seq: int | None = None) -> tuple[np.ndarray, int]:
+    model, tokenizer, is_uroman, _per_lang_lock = _get_mms(lang_iso639_3)
     input_text = _romanize(text) if is_uroman else text
     inputs = tokenizer(input_text, return_tensors="pt").to(DEVICE)
-    with lock:
+    # Use the SHARED GPU lock (qwen_lock) so MMS never runs on the GPU at the
+    # same time as a Qwen synthesis — mixing the two on one T4 is what caused
+    # garbled/interleaved output. A newer request supersedes this one.
+    with app.state.qwen_lock:
+        if my_seq is not None and not _is_current(my_seq):
+            raise RequestSuperseded()
         with torch.no_grad():
             output = model(**inputs).waveform
     audio = output[0].float().cpu().numpy()
@@ -484,16 +528,22 @@ def text_to_speech(
 
     engine, arg, preprocess = _route_engine(body.language_code)
     voice = _resolve_voice(voice_id)
-    logger.info("synth engine=%s arg=%s voice=%s preprocess=%s len=%d", engine, arg, voice, preprocess, len(text))
+    # Claim a generation: this supersedes any older in-flight synthesis, which
+    # will abort at its next chunk boundary and release the GPU.
+    my_seq = _claim_request()
+    logger.info("synth seq=%d engine=%s arg=%s voice=%s preprocess=%s len=%d", my_seq, engine, arg, voice, preprocess, len(text))
 
     if preprocess == "latn-to-devanagari":
         text = _latn_to_devanagari(text)
 
     try:
         if engine == "qwen":
-            audio, sr = _qwen_synthesize(text, arg, speaker=voice)
+            audio, sr = _qwen_synthesize(text, arg, speaker=voice, my_seq=my_seq)
         else:
-            audio, sr = _mms_synthesize(text, arg)
+            audio, sr = _mms_synthesize(text, arg, my_seq=my_seq)
+    except RequestSuperseded:
+        logger.info("synth seq=%d superseded by newer request", my_seq)
+        raise HTTPException(status_code=409, detail="superseded by a newer TTS request")
     except Exception as exc:
         logger.exception("tts generation failed (engine=%s arg=%s)", engine, arg)
         raise HTTPException(status_code=500, detail=f"tts generation failed: {exc}") from exc
@@ -544,7 +594,9 @@ def text_to_speech_stream(
 
     engine, arg, preprocess = _route_engine(body.language_code)
     voice = _resolve_voice(voice_id)
-    logger.info("stream engine=%s arg=%s voice=%s preprocess=%s len=%d", engine, arg, voice, preprocess, len(text))
+    # Claim a generation so this stream supersedes any older in-flight request.
+    my_seq = _claim_request()
+    logger.info("stream seq=%d engine=%s arg=%s voice=%s preprocess=%s len=%d", my_seq, engine, arg, voice, preprocess, len(text))
 
     if preprocess == "latn-to-devanagari":
         text = _latn_to_devanagari(text)
@@ -556,13 +608,16 @@ def text_to_speech_stream(
     def _pcm_frames():
         try:
             if engine == "qwen":
-                for arr, _sr in _qwen_stream(text, arg, speaker=voice):
+                for arr, _sr in _qwen_stream(text, arg, speaker=voice, my_seq=my_seq):
                     pcm16 = (np.clip(arr, -1.0, 1.0) * 32767.0).astype("<i2")
                     yield pcm16.tobytes()
             else:
-                audio, _sr = _mms_synthesize(text, arg)
+                audio, _sr = _mms_synthesize(text, arg, my_seq=my_seq)
                 pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2")
                 yield pcm16.tobytes()
+        except RequestSuperseded:
+            logger.info("stream seq=%d superseded by newer request", my_seq)
+            return
         except Exception as exc:  # pragma: no cover
             logger.exception("stream tts failed (engine=%s arg=%s)", engine, arg)
             # Can't change status mid-stream; just stop. Caller sees a short body.
