@@ -36,7 +36,7 @@ gcloud compute instances create "${INSTANCE}" \
     --machine-type="${MACHINE}" \
     --accelerator="type=nvidia-tesla-t4,count=1" \
     --maintenance-policy=TERMINATE \
-    --image-family=common-cu124-ubuntu-2204 \
+    --image-family=common-cu129-ubuntu-2204-nvidia-580 \
     --image-project=deeplearning-platform-release \
     --boot-disk-size="${DISK_GB}GB" \
     --boot-disk-type=pd-ssd \

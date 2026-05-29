@@ -98,7 +98,7 @@ Set-Content -Path $tmp -Value $startup -NoNewline -Encoding UTF8
     --provisioning-model=SPOT `
     --instance-termination-action=STOP `
     --maintenance-policy=TERMINATE `
-    --image-family=common-cu124-ubuntu-2204 `
+    --image-family=common-cu129-ubuntu-2204-nvidia-580 `
     --image-project=deeplearning-platform-release `
     --boot-disk-size="${DiskGB}GB" `
     --boot-disk-type=pd-ssd `
