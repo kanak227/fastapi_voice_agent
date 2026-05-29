@@ -368,14 +368,22 @@ class DeepgramElevenLabsProvider(SpeechProvider):
             "nl": "nl", "sv": "sv", "ru": "ru",
         }
         lang_code = (language or "en-US").strip()
-        elevenlabs_lang = _ELEVENLABS_LANG_MAP.get(lang_code, lang_code.split("-")[0])
+        if backend_label == "qwen":
+            # The Qwen/MMS service does its own language routing and needs the
+            # full BCP-47 code intact — especially "hi-Latn" (Hinglish), which
+            # it converts to Devanagari before MMS Hindi synthesis. Collapsing
+            # it to "hi" here would feed romanized Latin into a Devanagari-only
+            # tokenizer and crash with "input size 0".
+            send_lang = lang_code
+        else:
+            send_lang = _ELEVENLABS_LANG_MAP.get(lang_code, lang_code.split("-")[0])
 
         url = f"{base_url.rstrip('/')}/text-to-speech/{voice_id}"
         payload: dict = {
             "text": self._strip_emotion_label(text),
             "model_id": self._normalize_elevenlabs_model(config.ELEVENLABS_MODEL_ID),
             "output_format": fmt,
-            "language_code": elevenlabs_lang,
+            "language_code": send_lang,
         }
         voice_settings = self._emotion_to_voice_settings(emotion)
         if voice_settings:

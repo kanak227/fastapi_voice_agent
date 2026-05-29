@@ -570,7 +570,7 @@ const sendMessageToAPI = async (userMessage) => {
                     )}
                   </div>
                   <span className="text-xs text-zinc-400">Voice language</span>
-                  <TtsSettingsPanel className="ml-auto" />
+                  <TtsSettingsPanel className="ml-auto" language={voiceLanguage} />
                 </div>
                 <div className="flex items-end gap-2">
                   <VoiceOrb
