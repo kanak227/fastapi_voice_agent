@@ -16,20 +16,25 @@ curl -s -X POST "$BASE/v1/text-to-speech/serena" \
   -o /tmp/serena.mp3 -D /tmp/serena.hdr -w 'HTTP %{http_code} size=%{size_download}\n'
 grep -i 'x-voice-id\|x-engine\|x-language' /tmp/serena.hdr
 
-echo "=== ethan (en) ==="
-curl -s -X POST "$BASE/v1/text-to-speech/ethan" \
+echo "=== ryan (en) ==="
+curl -s -X POST "$BASE/v1/text-to-speech/ryan" \
   -H 'Content-Type: application/json' \
   -d '{"text":"Hello, this is a voice selection test.","language_code":"en"}' \
   -o /tmp/ethan.mp3 -D /tmp/ethan.hdr -w 'HTTP %{http_code} size=%{size_download}\n'
 grep -i 'x-voice-id\|x-engine\|x-language' /tmp/ethan.hdr
 
-echo "=== voice-selection check (serena vs ethan must differ) ==="
+echo "=== voice-selection check (serena vs ryan must differ) ==="
 S=$(md5sum /tmp/serena.mp3 | cut -d' ' -f1)
 E=$(md5sum /tmp/ethan.mp3 | cut -d' ' -f1)
 echo "serena md5=$S"
 echo "ethan  md5=$E"
 if [ "$S" != "$E" ] && [ -s /tmp/serena.mp3 ] && [ -s /tmp/ethan.mp3 ]; then
-  echo "PASS: voices produce different audio"
+  # Both must be real audio (HTTP 200), not error JSON. Check the http codes captured above.
+  if head -c 4 /tmp/serena.mp3 | grep -q "{" || head -c 4 /tmp/ethan.mp3 | grep -q "{"; then
+    echo "FAIL: one of the voices returned an error JSON, not audio"
+  else
+    echo "PASS: voices produce different audio"
+  fi
 else
   echo "FAIL: voices identical or empty"
 fi

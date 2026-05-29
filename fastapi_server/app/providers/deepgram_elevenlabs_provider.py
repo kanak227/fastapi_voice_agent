@@ -256,8 +256,11 @@ class DeepgramElevenLabsProvider(SpeechProvider):
         if not config.QWEN_TTS_BASE_URL:
             return []
         
-        # Fetch all voices from Qwen TTS service (no language filtering on backend)
-        url = f"{config.QWEN_TTS_BASE_URL.rstrip('/')}/v1/voices"
+        # Fetch all voices from Qwen TTS service (no language filtering on backend).
+        # QWEN_TTS_BASE_URL already includes the /v1 prefix (same convention as
+        # synthesize_text, which posts to {base}/text-to-speech/...), so append
+        # only /voices here — appending /v1/voices would double the prefix.
+        url = f"{config.QWEN_TTS_BASE_URL.rstrip('/')}/voices"
         
         headers: dict[str, str] = {}
         if config.QWEN_TTS_API_KEY:
