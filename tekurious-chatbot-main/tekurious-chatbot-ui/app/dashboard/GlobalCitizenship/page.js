@@ -8,7 +8,7 @@ import { Sidebar } from '@/app/components/Sidebar';
 import { VoiceOrb } from '@/components/voice-orb';
 import { useVoiceChat } from '@/hooks/use-voice-chat';
 import { streamRecordedVoiceTurn } from '@/lib/voice-streaming';
-import { playAudioChunk } from '@/lib/audio-playback';
+import { playAudioChunk, stopAudioPlayback } from '@/lib/audio-playback';
 import { ChatMessage } from '@/components/chat-message';
 
 import { TtsSettingsPanel } from '@/components/tts-settings-panel';
@@ -137,6 +137,8 @@ export default function Dashboard() {
       voiceAbortControllerRef.current.abort();
       voiceAbortControllerRef.current = null;
     }
+    // Stop gapless Web Audio playback (realtime streamed windows)
+    stopAudioPlayback();
     // Stop current audio
     if (currentAudioRef.current) {
       currentAudioRef.current.pause();
