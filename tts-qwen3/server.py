@@ -89,41 +89,67 @@ QWEN_LANG_MAP: dict[str, str] = {
 
 # Map BCP-47 codes to Meta MMS-TTS ISO 639-3 model suffixes.
 # https://huggingface.co/facebook/mms-tts-{code}
+# NOTE: MMS is now only used as a FALLBACK for languages not covered by
+# AI4Bharat FastPitch (Urdu, Arabic). For the 13 Indian languages that
+# FastPitch supports, it is preferred due to much better quality and speed.
 MMS_LANG_MAP: dict[str, str] = {
-    "hi": "hin",
-    "hi-latn": "hin",  # romanized Hindi reads back as Hindi audio
-    "ta": "tam",
-    "te": "tel",
-    "mr": "mar",
-    "bn": "ben",
-    "gu": "guj",
-    "kn": "kan",
-    "ml": "mal",
-    "pa": "pan",
     "ur": "urd-script_arabic",  # Urdu MMS ships only as the Arabic-script checkpoint
     "ar": "ara",
 }
 
+# AI4Bharat FastPitch + HiFiGAN: high-quality, fully-parallel TTS for 13
+# Indian languages. Trained on IndicTTS dataset (studio recordings, male +
+# female speakers). Published at ICASSP 2023, SOTA for all 13 languages.
+# Models downloaded from: https://github.com/AI4Bharat/Indic-TTS/releases/tag/v1-checkpoints-release
+FASTPITCH_LANG_MAP: dict[str, str] = {
+    "hi": "hi",
+    "hi-latn": "hi",  # Hinglish -> Hindi voice (text is transliterated upstream)
+    "ta": "ta",
+    "te": "te",
+    "mr": "mr",
+    "bn": "bn",
+    "gu": "gu",
+    "kn": "kn",
+    "ml": "ml",
+    "pa": "pa",
+    "as": "as",  # Assamese
+    "or": "or",  # Odia
+    "raj": "raj",  # Rajasthani
+}
+
+# Base directory where FastPitch checkpoints are stored (per-language subdirs).
+FASTPITCH_MODELS_DIR = os.getenv("FASTPITCH_MODELS_DIR", "/models/fastpitch")
+
 
 # Voice catalog. The voice_id is what the chatbot sends in the URL path.
-# When the underlying engine is MMS-TTS the voice is irrelevant (single
-# speaker per language) but we still expose names for UI consistency.
 VOICE_CATALOG: list[dict] = [
+    # Qwen3-TTS voices (English + CJK + European)
     {"voice_id": "serena", "name": "Serena", "labels": {"gender": "female", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
     {"voice_id": "vivian", "name": "Vivian", "labels": {"gender": "female", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
     {"voice_id": "ryan", "name": "Ryan", "labels": {"gender": "male", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
     {"voice_id": "aiden", "name": "Aiden", "labels": {"gender": "male", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
     {"voice_id": "eric", "name": "Eric", "labels": {"gender": "male", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
     {"voice_id": "dylan", "name": "Dylan", "labels": {"gender": "male", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
-    {"voice_id": "mms-hindi", "name": "Hindi (MMS)", "labels": {"gender": "neutral", "accent": "hindi"}, "languages": ["hi", "hi-Latn"]},
-    {"voice_id": "mms-tamil", "name": "Tamil (MMS)", "labels": {"gender": "neutral", "accent": "tamil"}, "languages": ["ta"]},
-    {"voice_id": "mms-telugu", "name": "Telugu (MMS)", "labels": {"gender": "neutral", "accent": "telugu"}, "languages": ["te"]},
-    {"voice_id": "mms-marathi", "name": "Marathi (MMS)", "labels": {"gender": "neutral", "accent": "marathi"}, "languages": ["mr"]},
-    {"voice_id": "mms-bengali", "name": "Bengali (MMS)", "labels": {"gender": "neutral", "accent": "bengali"}, "languages": ["bn"]},
-    {"voice_id": "mms-gujarati", "name": "Gujarati (MMS)", "labels": {"gender": "neutral", "accent": "gujarati"}, "languages": ["gu"]},
-    {"voice_id": "mms-kannada", "name": "Kannada (MMS)", "labels": {"gender": "neutral", "accent": "kannada"}, "languages": ["kn"]},
-    {"voice_id": "mms-malayalam", "name": "Malayalam (MMS)", "labels": {"gender": "neutral", "accent": "malayalam"}, "languages": ["ml"]},
-    {"voice_id": "mms-punjabi", "name": "Punjabi (MMS)", "labels": {"gender": "neutral", "accent": "punjabi"}, "languages": ["pa"]},
+    # AI4Bharat FastPitch voices (Indian languages — male + female per language)
+    {"voice_id": "indic-hindi-female", "name": "Hindi Female", "labels": {"gender": "female", "accent": "hindi"}, "languages": ["hi", "hi-Latn"]},
+    {"voice_id": "indic-hindi-male", "name": "Hindi Male", "labels": {"gender": "male", "accent": "hindi"}, "languages": ["hi", "hi-Latn"]},
+    {"voice_id": "indic-tamil-female", "name": "Tamil Female", "labels": {"gender": "female", "accent": "tamil"}, "languages": ["ta"]},
+    {"voice_id": "indic-tamil-male", "name": "Tamil Male", "labels": {"gender": "male", "accent": "tamil"}, "languages": ["ta"]},
+    {"voice_id": "indic-telugu-female", "name": "Telugu Female", "labels": {"gender": "female", "accent": "telugu"}, "languages": ["te"]},
+    {"voice_id": "indic-telugu-male", "name": "Telugu Male", "labels": {"gender": "male", "accent": "telugu"}, "languages": ["te"]},
+    {"voice_id": "indic-marathi-female", "name": "Marathi Female", "labels": {"gender": "female", "accent": "marathi"}, "languages": ["mr"]},
+    {"voice_id": "indic-marathi-male", "name": "Marathi Male", "labels": {"gender": "male", "accent": "marathi"}, "languages": ["mr"]},
+    {"voice_id": "indic-bengali-female", "name": "Bengali Female", "labels": {"gender": "female", "accent": "bengali"}, "languages": ["bn"]},
+    {"voice_id": "indic-bengali-male", "name": "Bengali Male", "labels": {"gender": "male", "accent": "bengali"}, "languages": ["bn"]},
+    {"voice_id": "indic-gujarati-female", "name": "Gujarati Female", "labels": {"gender": "female", "accent": "gujarati"}, "languages": ["gu"]},
+    {"voice_id": "indic-gujarati-male", "name": "Gujarati Male", "labels": {"gender": "male", "accent": "gujarati"}, "languages": ["gu"]},
+    {"voice_id": "indic-kannada-female", "name": "Kannada Female", "labels": {"gender": "female", "accent": "kannada"}, "languages": ["kn"]},
+    {"voice_id": "indic-kannada-male", "name": "Kannada Male", "labels": {"gender": "male", "accent": "kannada"}, "languages": ["kn"]},
+    {"voice_id": "indic-malayalam-female", "name": "Malayalam Female", "labels": {"gender": "female", "accent": "malayalam"}, "languages": ["ml"]},
+    {"voice_id": "indic-malayalam-male", "name": "Malayalam Male", "labels": {"gender": "male", "accent": "malayalam"}, "languages": ["ml"]},
+    {"voice_id": "indic-punjabi-female", "name": "Punjabi Female", "labels": {"gender": "female", "accent": "punjabi"}, "languages": ["pa"]},
+    {"voice_id": "indic-punjabi-male", "name": "Punjabi Male", "labels": {"gender": "male", "accent": "punjabi"}, "languages": ["pa"]},
+    # MMS fallback voices (Urdu, Arabic — not covered by FastPitch)
     {"voice_id": "mms-urdu", "name": "Urdu (MMS)", "labels": {"gender": "neutral", "accent": "urdu"}, "languages": ["ur"]},
     {"voice_id": "mms-arabic", "name": "Arabic (MMS)", "labels": {"gender": "neutral", "accent": "arabic"}, "languages": ["ar"]},
 ]
@@ -198,6 +224,9 @@ def _load_models() -> None:
     app.state.mms_cache: dict[str, tuple] = {}
     app.state.mms_lock = threading.Lock()
     app.state.uroman = None  # lazy-init
+    # FastPitch models are also lazy-loaded per language.
+    app.state.fastpitch_cache: dict[str, object] = {}
+    app.state.fastpitch_lock = threading.Lock()
     app.state.graphs_warmed = False
 
     # ---- Request superseding -------------------------------------------------
@@ -479,6 +508,87 @@ def _mms_synthesize(text: str, lang_iso639_3: str, my_seq: int | None = None) ->
 
 
 # ---------------------------------------------------------------------------
+# Engine: AI4Bharat FastPitch + HiFiGAN (13 Indian languages)
+# ---------------------------------------------------------------------------
+# Fully parallel (non-autoregressive) — generates mel spectrograms in one
+# forward pass, then HiFiGAN converts to audio. RTF ~0.5-0.8 even on CPU.
+# Male + female speakers per language. Handles punctuation natively.
+
+def _get_fastpitch(lang_code: str, speaker: str = "female"):
+    """Lazy-load a FastPitch + HiFiGAN synthesizer for the given language.
+
+    Returns a Coqui TTS Synthesizer instance. Cached per (lang, speaker) pair.
+    """
+    cache: dict = app.state.fastpitch_cache
+    cache_key = f"{lang_code}_{speaker}"
+    if cache_key in cache:
+        return cache[cache_key]
+
+    with app.state.fastpitch_lock:
+        if cache_key in cache:
+            return cache[cache_key]
+
+        from TTS.utils.synthesizer import Synthesizer
+
+        model_dir = os.path.join(FASTPITCH_MODELS_DIR, lang_code)
+        fp_model = os.path.join(model_dir, "fastpitch", "best_model.pth")
+        fp_config = os.path.join(model_dir, "fastpitch", "config.json")
+        hfg_model = os.path.join(model_dir, "hifigan", "best_model.pth")
+        hfg_config = os.path.join(model_dir, "hifigan", "config.json")
+
+        if not os.path.exists(fp_model):
+            raise HTTPException(
+                status_code=500,
+                detail=f"FastPitch model not found for language '{lang_code}' at {fp_model}",
+            )
+
+        logger.info("Loading FastPitch + HiFiGAN for %s (speaker=%s)", lang_code, speaker)
+        synth = Synthesizer(
+            tts_checkpoint=fp_model,
+            tts_config_path=fp_config,
+            vocoder_checkpoint=hfg_model,
+            vocoder_config=hfg_config,
+            use_cuda=False,  # CPU is fast enough (RTF<1) and avoids GPU contention with Qwen
+        )
+        cache[cache_key] = synth
+        logger.info("FastPitch %s loaded (sample_rate=%d)", lang_code, synth.output_sample_rate)
+        return synth
+
+
+def _resolve_fastpitch_speaker(voice_id: str) -> str:
+    """Extract speaker gender from voice_id like 'indic-hindi-male' -> 'male'."""
+    if voice_id and "male" in voice_id:
+        return "male"
+    return "female"
+
+
+def _fastpitch_synthesize(text: str, lang_code: str, speaker: str = "female", my_seq: int | None = None) -> tuple[np.ndarray, int]:
+    """Synthesize text using AI4Bharat FastPitch + HiFiGAN.
+
+    Runs on CPU (fully parallel, RTF < 1.0) so it doesn't contend with
+    Qwen3 for the GPU. Handles punctuation natively — commas produce pauses,
+    periods produce sentence breaks.
+    """
+    if my_seq is not None and not _is_current(my_seq):
+        raise RequestSuperseded()
+
+    synth = _get_fastpitch(lang_code, speaker)
+    sr = synth.output_sample_rate
+
+    # Synthesize (Coqui TTS handles text splitting internally)
+    wav = synth.tts(text, speaker_name=speaker)
+
+    if my_seq is not None and not _is_current(my_seq):
+        raise RequestSuperseded()
+
+    audio = np.array(wav, dtype=np.float32)
+    if len(audio) == 0:
+        raise RuntimeError(f"FastPitch produced empty audio for lang={lang_code}")
+
+    return audio, sr
+
+
+# ---------------------------------------------------------------------------
 # Routing + encoding
 # ---------------------------------------------------------------------------
 def _check_auth(xi_api_key: Optional[str]) -> None:
@@ -488,10 +598,27 @@ def _check_auth(xi_api_key: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="invalid api key")
 
 
+# Backward-compat: map old MMS voice IDs to new FastPitch voice IDs.
+# The frontend may still send "mms-hindi" etc. from cached configs.
+_VOICE_COMPAT_MAP: dict[str, str] = {
+    "mms-hindi": "indic-hindi-female",
+    "mms-tamil": "indic-tamil-female",
+    "mms-telugu": "indic-telugu-female",
+    "mms-marathi": "indic-marathi-female",
+    "mms-bengali": "indic-bengali-female",
+    "mms-gujarati": "indic-gujarati-female",
+    "mms-kannada": "indic-kannada-female",
+    "mms-malayalam": "indic-malayalam-female",
+    "mms-punjabi": "indic-punjabi-female",
+}
+
+
 def _resolve_voice(voice_id: str) -> str:
     vid = (voice_id or "").strip()
     if not vid:
         return DEFAULT_VOICE_ID
+    # Backward compat: translate old mms-* IDs to new indic-* IDs
+    vid = _VOICE_COMPAT_MAP.get(vid, vid)
     for v in VOICE_CATALOG:
         if v["voice_id"] == vid:
             return v["voice_id"]
@@ -501,8 +628,8 @@ def _resolve_voice(voice_id: str) -> str:
 def _route_engine(language_code: Optional[str]) -> tuple[str, str, str | None]:
     """Return (engine_name, engine_arg, preprocess) where:
 
-    - engine_name is "qwen" or "mms"
-    - engine_arg is the Qwen language label or the MMS ISO 639-3 suffix
+    - engine_name is "qwen", "fastpitch", or "mms"
+    - engine_arg is the Qwen language label, FastPitch lang code, or MMS ISO 639-3 suffix
     - preprocess is None or a tag like "latn-to-devanagari" telling the
       caller to transform text before sending it to the engine
     """
@@ -512,14 +639,21 @@ def _route_engine(language_code: Optional[str]) -> tuple[str, str, str | None]:
     raw = language_code.strip().lower()
     base = raw.split("-")[0]
 
-    # Hi-Latn = Hinglish: the user typed/said romanized Hindi. Convert to
-    # Devanagari so MMS Hindi can synthesize it.
+    # Hi-Latn = Hinglish: romanized Hindi -> transliterate to Devanagari for FastPitch
     if raw == "hi-latn":
-        return "mms", MMS_LANG_MAP["hi-latn"], "latn-to-devanagari"
+        return "fastpitch", FASTPITCH_LANG_MAP["hi-latn"], "latn-to-devanagari"
 
+    # Qwen handles English + CJK + European languages
     if base in QWEN_LANG_MAP:
         return "qwen", QWEN_LANG_MAP[base], None
 
+    # FastPitch handles 13 Indian languages (preferred over MMS)
+    if raw in FASTPITCH_LANG_MAP:
+        return "fastpitch", FASTPITCH_LANG_MAP[raw], None
+    if base in FASTPITCH_LANG_MAP:
+        return "fastpitch", FASTPITCH_LANG_MAP[base], None
+
+    # MMS fallback for remaining languages (Urdu, Arabic)
     if raw in MMS_LANG_MAP:
         return "mms", MMS_LANG_MAP[raw], None
     if base in MMS_LANG_MAP:
@@ -619,6 +753,9 @@ def text_to_speech(
     try:
         if engine == "qwen":
             audio, sr = _qwen_synthesize(text, arg, speaker=voice, my_seq=my_seq)
+        elif engine == "fastpitch":
+            fp_speaker = _resolve_fastpitch_speaker(voice)
+            audio, sr = _fastpitch_synthesize(text, arg, speaker=fp_speaker, my_seq=my_seq)
         else:
             audio, sr = _mms_synthesize(text, arg, my_seq=my_seq)
     except RequestSuperseded:
@@ -681,9 +818,13 @@ def text_to_speech_stream(
     if preprocess == "latn-to-devanagari":
         text = _latn_to_devanagari(text)
 
-    # Sample rate is fixed per engine (Qwen 24k, MMS 16k) — report Qwen's here;
-    # the body carries the actual samples and clients resample as needed.
-    sample_rate = 24000 if engine == "qwen" else 16000
+    # Sample rate is fixed per engine (Qwen 24k, FastPitch 22.05k, MMS 16k).
+    if engine == "qwen":
+        sample_rate = 24000
+    elif engine == "fastpitch":
+        sample_rate = 22050
+    else:
+        sample_rate = 16000
 
     def _pcm_frames():
         try:
@@ -691,6 +832,11 @@ def text_to_speech_stream(
                 for arr, _sr in _qwen_stream(text, arg, speaker=voice, my_seq=my_seq):
                     pcm16 = (np.clip(arr, -1.0, 1.0) * 32767.0).astype("<i2")
                     yield pcm16.tobytes()
+            elif engine == "fastpitch":
+                fp_speaker = _resolve_fastpitch_speaker(voice)
+                audio, _sr = _fastpitch_synthesize(text, arg, speaker=fp_speaker, my_seq=my_seq)
+                pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2")
+                yield pcm16.tobytes()
             else:
                 audio, _sr = _mms_synthesize(text, arg, my_seq=my_seq)
                 pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2")
