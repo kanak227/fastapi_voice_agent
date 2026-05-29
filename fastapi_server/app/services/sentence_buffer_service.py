@@ -17,13 +17,22 @@ from __future__ import annotations
 
 import re
 
-# Match complete sentences ending with .!? followed by whitespace or end of string.
-# Conservative pattern: avoids false-positive splits on abbreviations like
-# "e.g." or numeric points like "v1.0" by requiring a sentence end to be
-# followed by whitespace AND start with a non-alphanumeric / capital token,
-# but keeping the simple variant (handles 99% of LLM output) until the
-# regression suite proves we need fancier handling.
-_SENTENCE_RE = re.compile(r"[^.!?]+[.!?]+(?=\s|$)")
+# Match complete sentences ending with .!? followed by whitespace or end of
+# string (the normal case). PLUS a run-on case: punctuation immediately
+# followed by a capital letter or emoji with NO space, which LLMs emit
+# constantly (e.g. "...with you.What fascinating..." or "Hello!✨Welcome").
+# Without handling the run-on, an anchored match against a buffer that begins
+# with one fails entirely, so NO chunks get popped during streaming and the
+# whole reply plays as one late clip after a long silence.
+#
+# The run-on alternative requires the char BEFORE the punctuation to be a
+# letter (?<=[A-Za-z]) so we never split inside decimals ("9.99") or
+# single-letter abbreviations are at least not split on the digit side.
+_EMOJI_CLASS = "\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u2728"
+_SENTENCE_RE = re.compile(
+    r"[^.!?]+[.!?]+(?=\s|$)"
+    r"|[^.!?]+[.!?]+(?<=[A-Za-z][.!?])(?=[A-Z" + _EMOJI_CLASS + r"])"
+)
 
 # Soft break points within a long run-on sentence: comma, semicolon, em dash.
 _SOFT_BREAK_RE = re.compile(r"(?<=[,;])\s+")
