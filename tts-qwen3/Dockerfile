@@ -11,6 +11,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.11 python3.11-venv python3-pip \
         libsndfile1 ffmpeg ca-certificates curl \
+        sox libsox-fmt-all \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python && \

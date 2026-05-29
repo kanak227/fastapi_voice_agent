@@ -12,7 +12,13 @@ pydantic>=2.8.0
 torch==2.7.1
 torchaudio==2.7.1
 torchvision==0.22.1
+# qwen-tts is the upstream package (pulled in transitively by
+# faster-qwen3-tts, pinned here for reproducibility). faster-qwen3-tts adds a
+# CUDA-graph runtime + true streaming on top, cutting time-to-first-audio from
+# 6-40s to ~680ms on a T4 and reaching real-time RTF. Validated working with
+# torch 2.7.1 (CUDA graphs need torch>=2.5.1).
 qwen-tts==0.1.1
+faster-qwen3-tts>=0.2.6
 soundfile>=0.13.0
 numpy>=2.1.0
 uroman>=1.3.1

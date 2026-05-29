@@ -37,7 +37,7 @@ from fastapi import FastAPI, Header, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
-from qwen_tts import Qwen3TTSModel
+from faster_qwen3_tts import FasterQwen3TTS
 
 
 # ---------------------------------------------------------------------------
@@ -45,19 +45,17 @@ from qwen_tts import Qwen3TTSModel
 # ---------------------------------------------------------------------------
 QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
 DEVICE = os.getenv("QWEN_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-DTYPE_STR = os.getenv("QWEN_DTYPE", "float16" if torch.cuda.is_available() else "float32").lower()
+DTYPE_STR = os.getenv("QWEN_DTYPE", "float32").lower()
 DEFAULT_VOICE_ID = os.getenv("QWEN_DEFAULT_VOICE_ID", "serena")
 DEFAULT_LANGUAGE = os.getenv("QWEN_DEFAULT_LANGUAGE", "english")
 SEED = int(os.getenv("QWEN_SEED", "1234"))
 API_KEY = os.getenv("TTS_API_KEY", "")  # optional, blank = no auth
 
-# Run the model in float32 weights but cast matmuls to fp16 at runtime via
-# torch.autocast. On a T4 (Turing) fp32 runs at ~8 TFLOPS while fp16 tensor
-# cores hit ~65 TFLOPS, so autocast gives a large speedup. Loading the weights
-# directly as fp16 (.half()) instead crashes this model with a CUDA
-# device-side assert, so autocast is the safe way to get tensor-core speed.
-USE_AUTOCAST = os.getenv("QWEN_AUTOCAST", "true").lower() in {"1", "true", "yes", "on"}
-AUTOCAST_DTYPE = torch.float16 if os.getenv("QWEN_AUTOCAST_DTYPE", "float16").lower() == "float16" else torch.bfloat16
+# Streaming chunk size for FasterQwen3TTS. 8 steps ≈ 667ms of audio per chunk
+# at 12Hz. The faster runtime emits the first chunk in ~680ms on a T4 (vs
+# 6-40s for the old qwen-tts package), so even non-streaming HTTP responses
+# are assembled from these fast streamed chunks.
+QWEN_CHUNK_SIZE = int(os.getenv("QWEN_CHUNK_SIZE", "8"))
 
 DTYPE_MAP = {
     "float16": torch.float16,
@@ -177,7 +175,7 @@ def _set_seed(seed: int) -> None:
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
 def _load_models() -> None:
-    logger.info("Loading Qwen3-TTS %s on %s (dtype=%s)", QWEN_MODEL_ID, DEVICE, DTYPE_STR)
+    logger.info("Loading FasterQwen3TTS %s on %s (dtype=%s)", QWEN_MODEL_ID, DEVICE, DTYPE_STR)
     _set_seed(SEED)
 
     # Turing-era (T4) perf knobs: let cuDNN pick the fastest kernels and allow
@@ -187,50 +185,73 @@ def _load_models() -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    app.state.qwen_model = Qwen3TTSModel.from_pretrained(
-        QWEN_MODEL_ID,
-        device_map=DEVICE,
-        torch_dtype=TORCH_DTYPE,
-    )
+    # FasterQwen3TTS captures CUDA graphs for the talker + code-predictor on
+    # first use, collapsing ~500 tiny kernel launches per decode step into one
+    # replayed graph. This is what makes the T4 hit real-time (RTF ~1.0+,
+    # ~680ms time-to-first-audio) instead of the 6-40s the plain qwen-tts
+    # package produced (GPU was idle waiting on Python between kernels).
+    app.state.qwen_model = FasterQwen3TTS.from_pretrained(QWEN_MODEL_ID)
     app.state.qwen_lock = threading.Lock()
     # MMS models are lazy-loaded on first use to keep startup fast and
     # memory low when only some languages are actually used.
     app.state.mms_cache: dict[str, tuple] = {}
     app.state.mms_lock = threading.Lock()
     app.state.uroman = None  # lazy-init
-    logger.info(
-        "Qwen3-TTS ready (autocast=%s dtype=%s). MMS engines will load on demand.",
-        USE_AUTOCAST, str(AUTOCAST_DTYPE).replace("torch.", ""),
-    )
+    app.state.graphs_warmed = False
+
+    # Warm the CUDA graphs once so the first real request doesn't pay the
+    # capture cost (~3-5s). Best-effort; failures fall back to lazy capture.
+    try:
+        with app.state.qwen_lock:
+            for _chunk, _sr, _t in app.state.qwen_model.generate_custom_voice_streaming(
+                text="Hello.", language="English", speaker=DEFAULT_VOICE_ID,
+                chunk_size=QWEN_CHUNK_SIZE,
+            ):
+                pass
+        app.state.graphs_warmed = True
+        logger.info("FasterQwen3TTS CUDA graphs warmed.")
+    except Exception as exc:  # pragma: no cover - warmup is best effort
+        logger.warning("CUDA graph warmup skipped: %s", exc)
+
+    logger.info("FasterQwen3TTS ready. MMS engines will load on demand.")
 
 
 def _qwen_synthesize(text: str, language: str, speaker: str = None) -> tuple[np.ndarray, int]:
+    """Synthesize with FasterQwen3TTS via its streaming generator.
+
+    We consume the streaming generator and concatenate chunks. Even though
+    this HTTP endpoint returns a single clip, the streaming path is what gives
+    the low per-chunk latency (CUDA-graph replay), so first audio is ready in
+    well under a second and total time runs at ~real-time.
+    """
     speaker = speaker or DEFAULT_VOICE_ID
-    use_amp = USE_AUTOCAST and DEVICE != "cpu"
+    # FasterQwen3TTS expects capitalized language names ("English", "Chinese").
+    lang = (language or DEFAULT_LANGUAGE).strip()
+    if lang and lang.lower() != "auto":
+        lang = lang[:1].upper() + lang[1:]
+    else:
+        lang = DEFAULT_LANGUAGE[:1].upper() + DEFAULT_LANGUAGE[1:]
+
+    chunks: list[np.ndarray] = []
+    sr = 24000
     with app.state.qwen_lock:
-        _set_seed(SEED)
-        # inference_mode disables autograd bookkeeping (faster + less memory
-        # than no_grad for pure inference). autocast runs matmuls in fp16 on
-        # the T4 tensor cores while keeping fp32 weights/activations elsewhere.
         with torch.inference_mode():
-            if use_amp:
-                with torch.autocast(device_type="cuda", dtype=AUTOCAST_DTYPE):
-                    wavs, sr = app.state.qwen_model.generate_custom_voice(
-                        text=text,
-                        speaker=speaker,
-                        language=language,
-                    )
-            else:
-                wavs, sr = app.state.qwen_model.generate_custom_voice(
-                    text=text,
-                    speaker=speaker,
-                    language=language,
-                )
-    if not wavs:
-        raise RuntimeError("Qwen3 returned empty audio")
-    audio = wavs[0]
-    if hasattr(audio, "cpu"):
-        audio = audio.cpu().numpy()
+            for audio_chunk, chunk_sr, _timing in app.state.qwen_model.generate_custom_voice_streaming(
+                text=text,
+                language=lang,
+                speaker=speaker,
+                chunk_size=QWEN_CHUNK_SIZE,
+            ):
+                if chunk_sr:
+                    sr = int(chunk_sr)
+                arr = audio_chunk
+                if hasattr(arr, "cpu"):
+                    arr = arr.cpu().numpy()
+                chunks.append(np.asarray(arr, dtype=np.float32).reshape(-1))
+
+    if not chunks:
+        raise RuntimeError("FasterQwen3TTS returned empty audio")
+    audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
     return np.asarray(audio, dtype=np.float32), int(sr)
 
 
