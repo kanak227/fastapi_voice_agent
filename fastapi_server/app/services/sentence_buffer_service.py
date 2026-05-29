@@ -30,6 +30,7 @@ _SOFT_BREAK_RE = re.compile(r"(?<=[,;])\s+")
 
 DEFAULT_MAX_CHUNK_WORDS = 40        # ElevenLabs / cloud providers: per-sentence
 QWEN_MAX_CHUNK_WORDS = 80           # Self-hosted: bigger chunks → fewer gaps
+QWEN_FIRST_CHUNK_WORDS = 16         # Self-hosted: tiny first chunk → fast first audio
 
 
 class SentenceBufferService:

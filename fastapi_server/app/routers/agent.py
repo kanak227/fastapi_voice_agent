@@ -22,6 +22,7 @@ from app.services.input_router import input_router
 from app.services.sentence_buffer_service import (
     DEFAULT_MAX_CHUNK_WORDS,
     QWEN_MAX_CHUNK_WORDS,
+    QWEN_FIRST_CHUNK_WORDS,
     sentence_buffer_service,
 )
 from app.services.sse_assembler import SSEAssembler
@@ -277,11 +278,16 @@ async def stream_agent(
                         # Qwen3 has no streaming, so larger chunks reduce
                         # the audible gaps between clips.
                         text_buffer += piece
-                        chunk_words = (
-                            QWEN_MAX_CHUNK_WORDS
-                            if (body.tts_provider or "").lower() == "qwen"
-                            else DEFAULT_MAX_CHUNK_WORDS
-                        )
+                        # Buffer for TTS sentence detection. Self-hosted
+                        # Qwen3 has no streaming, so larger chunks reduce
+                        # the audible gaps between clips. But the FIRST chunk
+                        # is kept small so the user hears audio quickly instead
+                        # of waiting for a whole 80-word block to render.
+                        is_qwen = (body.tts_provider or "").lower() == "qwen"
+                        if is_qwen:
+                            chunk_words = QWEN_FIRST_CHUNK_WORDS if audio_idx == 0 else QWEN_MAX_CHUNK_WORDS
+                        else:
+                            chunk_words = DEFAULT_MAX_CHUNK_WORDS
                         ready, text_buffer = sentence_buffer_service.pop_leading_speech_chunks(
                             text_buffer, max_chunk_words=chunk_words
                         )
@@ -476,11 +482,11 @@ async def stream_agent_ws(
             if not tts_enabled or not text_piece:
                 return
             tts_tail += text_piece
-            chunk_words = (
-                QWEN_MAX_CHUNK_WORDS
-                if (tts_provider or "").lower() == "qwen"
-                else DEFAULT_MAX_CHUNK_WORDS
-            )
+            is_qwen = (tts_provider or "").lower() == "qwen"
+            if is_qwen:
+                chunk_words = QWEN_FIRST_CHUNK_WORDS if audio_idx == 0 else QWEN_MAX_CHUNK_WORDS
+            else:
+                chunk_words = DEFAULT_MAX_CHUNK_WORDS
             ready, tts_tail = sentence_buffer_service.pop_leading_speech_chunks(
                 tts_tail, max_chunk_words=chunk_words
             )
