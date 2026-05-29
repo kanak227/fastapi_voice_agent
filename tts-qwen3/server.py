@@ -628,14 +628,33 @@ def _preprocess_for_fastpitch(text: str, lang_code: str) -> str:
     """Comprehensive text preprocessing for FastPitch Indian language models.
 
     Handles:
+    - Emojis → stripped
     - Hindi danda/double danda → period (for sentence pauses)
     - Em-dash, en-dash → comma (for clause pauses)
-    - English words → Devanagari transliteration
+    - English words → stripped (backend normalizer should have converted them)
     - Remaining digits → Hindi number words
     - Markdown/symbols → stripped
     - Unsupported punctuation → mapped to supported equivalents
     """
     clean = text
+
+    # 0. Strip emojis FIRST (they're multi-byte and break everything)
+    clean = re.sub(
+        "["
+        "\U0001F300-\U0001F9FF"
+        "\U0001FA00-\U0001FAFF"
+        "\U00002600-\U000027BF"
+        "\U00002B00-\U00002BFF"
+        "\U0000FE00-\U0000FE0F"
+        "\U0000200D"
+        "\U000000A9\U000000AE"
+        "\U00002122\U00002139"
+        "\U0000203C\U00002049"
+        "\U0001F000-\U0001F0FF"
+        "\U0001F100-\U0001F1FF"
+        "\U000020E3"
+        "]+", "", clean
+    )
 
     # 1. Map unsupported punctuation to supported equivalents
     clean = clean.replace("\u0964", ".")   # । (danda) -> period
@@ -653,17 +672,20 @@ def _preprocess_for_fastpitch(text: str, lang_code: str) -> str:
     # 2. Strip markdown and symbols not in vocab
     clean = re.sub(r"[#*_~\[\]{}|\\@&%$₹€£¥+=<>^/]", "", clean)
 
-    # 3. Remove English words entirely (FastPitch Hindi has no Latin chars).
-    # The backend normalizer should have already converted important English
-    # terms, but any that slip through are simply stripped so speech flows
-    # without gaps or artifacts.
+    # 3. Remove English words entirely (FastPitch Hindi has no Latin chars)
     if lang_code in ("hi", "ta", "te", "mr", "bn", "gu", "kn", "ml", "pa"):
         clean = _LATIN_WORD_RE.sub("", clean)
 
     # 4. Convert any remaining digits to spoken words
     clean = _DIGIT_RE.sub(_digits_to_hindi_words, clean)
 
-    # 5. Collapse whitespace
+    # 5. Collapse whitespace and clean up punctuation artifacts
+    clean = re.sub(r"\s+", " ", clean).strip()
+    # Remove orphan punctuation (e.g., ", ," or ". ." from stripped words)
+    clean = re.sub(r"[,.\s]+([,.])", r"\1", clean)
+    clean = re.sub(r"([,.])\s*([,.])", r"\1", clean)
+    # Remove leading/trailing punctuation-only fragments
+    clean = re.sub(r"^\s*[,.;:]+\s*", "", clean)
     clean = re.sub(r"\s+", " ", clean).strip()
 
     return clean
