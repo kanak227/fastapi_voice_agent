@@ -27,6 +27,7 @@ import io
 import logging
 import os
 import random
+import re
 import threading
 from typing import Optional
 
@@ -382,20 +383,99 @@ def _get_mms(lang_iso639_3: str):
         return cache[lang_iso639_3]
 
 
+# ---------------------------------------------------------------------------
+# MMS prosody: the VITS tokenizer drops ALL punctuation (comma, period, danda,
+# question mark — none are in the 72-char vocab). So we split the input text
+# at clause/sentence boundaries, synthesize each phrase independently, and
+# stitch them together with silence gaps. This gives natural pauses that the
+# engine itself cannot produce.
+# ---------------------------------------------------------------------------
+# Sentence-ending punctuation (period, danda, question, exclamation).
+_MMS_SENTENCE_SPLIT = re.compile(r"(?<=[.!?\u0964\u0965])\s*")
+# Clause-level punctuation (comma, semicolon, colon, em-dash).
+_MMS_CLAUSE_SPLIT = re.compile(r"(?<=[,;:\u2014])\s*")
+
+# Silence durations in seconds (tuned for natural Hindi speech rhythm).
+_MMS_SENTENCE_PAUSE = 0.45   # ~450ms between sentences
+_MMS_CLAUSE_PAUSE = 0.20     # ~200ms at commas/semicolons
+
+
 def _mms_synthesize(text: str, lang_iso639_3: str, my_seq: int | None = None) -> tuple[np.ndarray, int]:
+    """Synthesize text via MMS-TTS with injected silence for prosody.
+
+    Because the MMS VITS tokenizer has no punctuation in its vocabulary,
+    commas/periods/dandas are silently dropped and the output is one
+    continuous monotone stream. We fix this by:
+    1. Splitting text at sentence boundaries → synthesize each separately
+    2. Splitting long sentences at clause boundaries (commas)
+    3. Inserting silence gaps between the resulting audio segments
+    """
     model, tokenizer, is_uroman, _per_lang_lock = _get_mms(lang_iso639_3)
-    input_text = _romanize(text) if is_uroman else text
-    inputs = tokenizer(input_text, return_tensors="pt").to(DEVICE)
-    # Use the SHARED GPU lock (qwen_lock) so MMS never runs on the GPU at the
-    # same time as a Qwen synthesis — mixing the two on one T4 is what caused
-    # garbled/interleaved output. A newer request supersedes this one.
+    sr = int(model.config.sampling_rate)
+
+    # Split into sentences first, then clauses within each sentence.
+    sentences = [s.strip() for s in _MMS_SENTENCE_SPLIT.split(text) if s.strip()]
+    if not sentences:
+        sentences = [text.strip()]
+
+    segments: list[tuple[str, float]] = []  # (phrase_text, pause_after)
+    for sent in sentences:
+        # Only split at clause boundaries if the sentence is long enough
+        # to benefit from internal pauses (>6 words). Short sentences like
+        # "एक, दो, तीन।" sound better synthesized as one unit.
+        words_in_sent = len(sent.split())
+        if words_in_sent > 6:
+            clauses = [c.strip() for c in _MMS_CLAUSE_SPLIT.split(sent) if c.strip()]
+        else:
+            clauses = [sent]
+        if not clauses:
+            clauses = [sent]
+        for i, clause in enumerate(clauses):
+            if i == len(clauses) - 1:
+                segments.append((clause, _MMS_SENTENCE_PAUSE))
+            else:
+                segments.append((clause, _MMS_CLAUSE_PAUSE))
+
+    # Synthesize all segments under a SINGLE GPU lock acquisition to avoid
+    # repeated lock contention and maximize throughput.
+    audio_parts: list[np.ndarray] = []
+
+    # Pre-tokenize all segments outside the lock (CPU work).
+    tokenized_segments: list[tuple[dict | None, float]] = []
+    for phrase, pause_sec in segments:
+        clean = re.sub(r"[,.;:!?\u0964\u0965\u2014\u2013\u2026\"'\-]", "", phrase).strip()
+        if not clean:
+            tokenized_segments.append((None, pause_sec))
+            continue
+        input_text = _romanize(clean) if is_uroman else clean
+        inputs = tokenizer(input_text, return_tensors="pt").to(DEVICE)
+        if inputs["input_ids"].shape[-1] <= 2:
+            tokenized_segments.append((None, pause_sec))
+        else:
+            tokenized_segments.append((inputs, pause_sec))
+
+    # Single GPU lock for all segments.
     with app.state.qwen_lock:
         if my_seq is not None and not _is_current(my_seq):
             raise RequestSuperseded()
         with torch.no_grad():
-            output = model(**inputs).waveform
-    audio = output[0].float().cpu().numpy()
-    return audio.astype(np.float32), int(model.config.sampling_rate)
+            for inputs, pause_sec in tokenized_segments:
+                if inputs is None:
+                    audio_parts.append(np.zeros(int(sr * pause_sec), dtype=np.float32))
+                    continue
+                # Check superseding between segments (cooperative abort).
+                if my_seq is not None and not _is_current(my_seq):
+                    raise RequestSuperseded()
+                output = model(**inputs).waveform
+                audio = output[0].float().cpu().numpy().astype(np.float32)
+                audio_parts.append(audio)
+                if pause_sec > 0:
+                    audio_parts.append(np.zeros(int(sr * pause_sec), dtype=np.float32))
+
+    if not audio_parts:
+        raise RuntimeError("MMS produced no audio segments")
+
+    return np.concatenate(audio_parts), sr
 
 
 # ---------------------------------------------------------------------------
