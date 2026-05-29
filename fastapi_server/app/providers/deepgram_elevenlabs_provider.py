@@ -334,6 +334,82 @@ class DeepgramElevenLabsProvider(SpeechProvider):
         
         return filtered_out
 
+    async def synthesize_text_stream(
+        self,
+        *,
+        text: str,
+        language: Optional[str] = None,
+        voice: Optional[str] = None,
+        request_id: Optional[str] = None,
+        tts_provider: Optional[str] = None,
+        window_seconds: float = 1.0,
+    ):
+        """Yield (wav_bytes, mime) windows as the Qwen TTS service renders them.
+
+        Streams raw PCM16 from the self-hosted /v1/text-to-speech-stream
+        endpoint and re-frames it into ~window_seconds WAV clips so the browser
+        can play each window with a plain <audio> element while the rest is
+        still being generated. Falls back to a single full clip for ElevenLabs
+        (which this deployment isn't using) by calling synthesize_text.
+        """
+        import io as _io
+        import wave as _wave
+
+        use_qwen = (tts_provider or "").strip().lower() == "qwen"
+        if not (use_qwen and config.QWEN_TTS_BASE_URL):
+            # Non-Qwen: no incremental API — emit one full clip.
+            audio_bytes, mime, _voice, _rid = await self.synthesize_text(
+                text=text, language=language, voice=voice,
+                request_id=request_id, tts_provider=tts_provider,
+            )
+            yield audio_bytes, mime
+            return
+
+        base_url = config.QWEN_TTS_BASE_URL
+        api_key = config.QWEN_TTS_API_KEY or ""
+        voice_id = (voice or config.QWEN_TTS_DEFAULT_VOICE_ID or "serena").strip()
+        lang_code = (language or "en-US").strip()
+
+        url = f"{base_url.rstrip('/')}/text-to-speech-stream/{voice_id}"
+        payload = {"text": self._strip_emotion_label(text), "language_code": lang_code}
+        headers = {"Content-Type": "application/json", "Accept": "audio/L16"}
+        if api_key:
+            headers["xi-api-key"] = api_key
+
+        def _wrap_wav(pcm: bytes, sr: int) -> bytes:
+            buf = _io.BytesIO()
+            with _wave.open(buf, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sr)
+                w.writeframes(pcm)
+            return buf.getvalue()
+
+        timeout = httpx.Timeout(180.0, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    raise DeepgramElevenLabsError(
+                        f"qwen stream TTS failed (status={resp.status_code}): {body[:200]!r}"
+                    )
+                try:
+                    sr = int(resp.headers.get("x-sample-rate") or 24000)
+                except ValueError:
+                    sr = 24000
+                window_bytes = max(1, int(sr * window_seconds)) * 2  # int16 mono
+                acc = bytearray()
+                async for raw in resp.aiter_bytes():
+                    if not raw:
+                        continue
+                    acc.extend(raw)
+                    while len(acc) >= window_bytes:
+                        frame = bytes(acc[:window_bytes])
+                        del acc[:window_bytes]
+                        yield _wrap_wav(frame, sr), "audio/wav"
+                if acc:
+                    yield _wrap_wav(bytes(acc), sr), "audio/wav"
+
     async def synthesize_text(
         self,
         *,

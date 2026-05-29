@@ -189,10 +189,23 @@ async def stream_agent(
                 """
                 nonlocal audio_idx
 
+                use_stream = (
+                    (body.tts_provider or "").strip().lower() == "qwen"
+                    and hasattr(provider, "synthesize_text_stream")
+                )
+
+                async def _emit_audio(idx: int, text: str, audio_bytes: bytes, mime: str):
+                    audio_payload = {
+                        "index": idx,
+                        "text": text,
+                        "mime_type": mime,
+                        "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
+                    }
+                    return f"event: audio\ndata: {json.dumps(audio_payload, ensure_ascii=True)}\n\n".encode()
+
                 async def _synthesize_one(text: str, idx: int):
-                    """Synthesize a single normalized sentence.
+                    """Synthesize a single normalized sentence (non-streaming).
                     Returns SSE-encoded audio event bytes or None on failure.
-                    idx is pre-assigned to guarantee correct ordering.
                     """
                     try:
                         audio_bytes, mime, voice_used, tts_req_id = await provider.synthesize_text(
@@ -204,17 +217,45 @@ async def stream_agent(
                             output_format=body.tts_format,
                             tts_provider=body.tts_provider,
                         )
-                        audio_payload = {
-                            "index": idx,
-                            "text": text,
-                            "mime_type": mime,
-                            "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
-                        }
-                        return f"event: audio\ndata: {json.dumps(audio_payload, ensure_ascii=True)}\n\n".encode()
+                        return await _emit_audio(idx, text, audio_bytes, mime)
                     except Exception as tts_exc:
                         logger.warning("tts_chunk_failed request_id=%s err=%s", request_id, tts_exc)
                         return None
 
+                # ---- Realtime streaming path (Qwen) --------------------------
+                # Process sentences STRICTLY in order. For each sentence, stream
+                # its ~1s WAV windows as the GPU renders them and emit each as an
+                # audio event immediately. Because we never run two sentences
+                # concurrently and the windows are yielded in generation order,
+                # the audio_idx is strictly increasing and playback stays in
+                # order — no interleaving, no shuffling.
+                if use_stream:
+                    while True:
+                        sentence = await tts_queue.get()
+                        if sentence is None:
+                            break
+                        speech_text = voice_text_normalizer.normalize_sentence(sentence)
+                        if not speech_text:
+                            continue
+                        try:
+                            async for win_bytes, win_mime in provider.synthesize_text_stream(
+                                text=speech_text,
+                                language=body.language,
+                                voice=body.tts_voice,
+                                request_id=None,
+                                tts_provider=body.tts_provider,
+                            ):
+                                idx = audio_idx
+                                audio_idx += 1
+                                await audio_queue.put(
+                                    await _emit_audio(idx, speech_text, win_bytes, win_mime)
+                                )
+                        except Exception as tts_exc:
+                            logger.warning("tts_stream_failed request_id=%s err=%s", request_id, tts_exc)
+                    await audio_queue.put(None)
+                    return
+
+                # ---- Non-streaming path (ElevenLabs / fallback) --------------
                 # Lookahead pre-buffering pipeline.
                 # We maintain a deque of in-flight synthesis futures (max 2) so that
                 # chunk N+1 is already synthesizing while chunk N is being transmitted.

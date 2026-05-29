@@ -35,7 +35,7 @@ import soundfile as sf
 import torch
 from fastapi import FastAPI, Header, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from faster_qwen3_tts import FasterQwen3TTS
 
@@ -216,24 +216,23 @@ def _load_models() -> None:
     logger.info("FasterQwen3TTS ready. MMS engines will load on demand.")
 
 
-def _qwen_synthesize(text: str, language: str, speaker: str = None) -> tuple[np.ndarray, int]:
-    """Synthesize with FasterQwen3TTS via its streaming generator.
-
-    We consume the streaming generator and concatenate chunks. Even though
-    this HTTP endpoint returns a single clip, the streaming path is what gives
-    the low per-chunk latency (CUDA-graph replay), so first audio is ready in
-    well under a second and total time runs at ~real-time.
-    """
-    speaker = speaker or DEFAULT_VOICE_ID
-    # FasterQwen3TTS expects capitalized language names ("English", "Chinese").
+def _normalize_qwen_lang(language: str) -> str:
+    """FasterQwen3TTS expects capitalized language names ('English')."""
     lang = (language or DEFAULT_LANGUAGE).strip()
     if lang and lang.lower() != "auto":
-        lang = lang[:1].upper() + lang[1:]
-    else:
-        lang = DEFAULT_LANGUAGE[:1].upper() + DEFAULT_LANGUAGE[1:]
+        return lang[:1].upper() + lang[1:]
+    return DEFAULT_LANGUAGE[:1].upper() + DEFAULT_LANGUAGE[1:]
 
-    chunks: list[np.ndarray] = []
-    sr = 24000
+
+def _qwen_stream(text: str, language: str, speaker: str = None):
+    """Yield (audio_float32_mono, sample_rate) sub-chunks as the model renders.
+
+    This is the realtime path: FasterQwen3TTS emits ~0.67s of audio every
+    QWEN_CHUNK_SIZE steps (~680ms to first chunk on a T4), so the caller can
+    forward audio to the browser while the rest is still being generated.
+    """
+    speaker = speaker or DEFAULT_VOICE_ID
+    lang = _normalize_qwen_lang(language)
     with app.state.qwen_lock:
         with torch.inference_mode():
             for audio_chunk, chunk_sr, _timing in app.state.qwen_model.generate_custom_voice_streaming(
@@ -242,12 +241,23 @@ def _qwen_synthesize(text: str, language: str, speaker: str = None) -> tuple[np.
                 speaker=speaker,
                 chunk_size=QWEN_CHUNK_SIZE,
             ):
-                if chunk_sr:
-                    sr = int(chunk_sr)
                 arr = audio_chunk
                 if hasattr(arr, "cpu"):
                     arr = arr.cpu().numpy()
-                chunks.append(np.asarray(arr, dtype=np.float32).reshape(-1))
+                yield np.asarray(arr, dtype=np.float32).reshape(-1), int(chunk_sr or 24000)
+
+
+def _qwen_synthesize(text: str, language: str, speaker: str = None) -> tuple[np.ndarray, int]:
+    """Synthesize a full clip by consuming the streaming generator.
+
+    Used by the non-streaming endpoint. The streaming path underneath is what
+    gives the low per-chunk latency (CUDA-graph replay).
+    """
+    chunks: list[np.ndarray] = []
+    sr = 24000
+    for arr, chunk_sr in _qwen_stream(text, language, speaker):
+        sr = chunk_sr
+        chunks.append(arr)
 
     if not chunks:
         raise RuntimeError("FasterQwen3TTS returned empty audio")
@@ -505,6 +515,69 @@ def text_to_speech(
             "X-Engine": engine,
             "X-Language": arg,
             "X-Sample-Rate": str(sr),
+        },
+    )
+
+
+@app.post("/v1/text-to-speech-stream/{voice_id}")
+def text_to_speech_stream(
+    body: TTSRequestBody,
+    voice_id: str = Path(...),
+    xi_api_key: Optional[str] = Header(default=None, alias="xi-api-key"),
+):
+    """Realtime TTS: stream raw PCM16 (mono) frames as the model renders them.
+
+    For Qwen voices this forwards each ~0.67s sub-chunk the instant
+    FasterQwen3TTS produces it (first chunk in ~680ms on a T4), so the caller
+    can start playback immediately instead of waiting for the whole clip.
+    MMS voices have no incremental API, so we render once and emit a single
+    frame. The response is a chunked stream of little-endian int16 samples;
+    the sample rate is sent in the X-Sample-Rate header before the body.
+    """
+    _check_auth(xi_api_key)
+    if not hasattr(app.state, "qwen_model") or app.state.qwen_model is None:
+        raise HTTPException(status_code=503, detail="model not loaded")
+
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is empty")
+
+    engine, arg, preprocess = _route_engine(body.language_code)
+    voice = _resolve_voice(voice_id)
+    logger.info("stream engine=%s arg=%s voice=%s preprocess=%s len=%d", engine, arg, voice, preprocess, len(text))
+
+    if preprocess == "latn-to-devanagari":
+        text = _latn_to_devanagari(text)
+
+    # Sample rate is fixed per engine (Qwen 24k, MMS 16k) — report Qwen's here;
+    # the body carries the actual samples and clients resample as needed.
+    sample_rate = 24000 if engine == "qwen" else 16000
+
+    def _pcm_frames():
+        try:
+            if engine == "qwen":
+                for arr, _sr in _qwen_stream(text, arg, speaker=voice):
+                    pcm16 = (np.clip(arr, -1.0, 1.0) * 32767.0).astype("<i2")
+                    yield pcm16.tobytes()
+            else:
+                audio, _sr = _mms_synthesize(text, arg)
+                pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2")
+                yield pcm16.tobytes()
+        except Exception as exc:  # pragma: no cover
+            logger.exception("stream tts failed (engine=%s arg=%s)", engine, arg)
+            # Can't change status mid-stream; just stop. Caller sees a short body.
+            return
+
+    return StreamingResponse(
+        _pcm_frames(),
+        media_type="audio/L16",
+        headers={
+            "X-Voice-Id": voice_id,
+            "X-Engine": engine,
+            "X-Language": arg,
+            "X-Sample-Rate": str(sample_rate),
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
         },
     )
 
