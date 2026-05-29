@@ -31,7 +31,12 @@ COPY server.py .
 
 # FastPitch model checkpoints live on the persistent volume (/models/fastpitch)
 # mounted at runtime, NOT baked into the image. This keeps the image lean.
+# The Coqui TTS config.json files reference speakers.pth via a hardcoded path
+# (/app/models/v1/<lang>/...) so we create symlinks at container start.
 ENV FASTPITCH_MODELS_DIR=/models/fastpitch
+
+# Entrypoint script creates symlinks then starts uvicorn.
+RUN printf '#!/bin/bash\nset -e\nmkdir -p /app/models/v1\nfor d in /models/fastpitch/*/; do\n  lang=$(basename "$d")\n  ln -sf "/models/fastpitch/$lang" "/app/models/v1/$lang"\ndone\nexec python -m uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 ENV PORT=8000 \
     QWEN_DEVICE=cuda \
@@ -42,4 +47,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
     CMD curl -fsS http://localhost:${PORT}/health || exit 1
 
-CMD ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["/bin/bash", "/app/entrypoint.sh"]
