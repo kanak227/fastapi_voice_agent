@@ -118,8 +118,9 @@ async def synthesize(
     from app.services.voice_text_normalizer import voice_text_normalizer
 
     rid = body.request_id or str(uuid.uuid4())
-    # Normalize text for natural speech (strip markdown, emojis, etc.)
-    speech_text = voice_text_normalizer.normalize(body.text) or body.text
+    # Normalize text for natural speech (strip markdown, expand numbers/dates
+    # in the target language, etc.)
+    speech_text = voice_text_normalizer.normalize(body.text, body.language) or body.text
     try:
         audio_bytes, mime, voice_used, final_rid = await provider.synthesize_text(
             text=speech_text,

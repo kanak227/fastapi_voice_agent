@@ -234,7 +234,7 @@ async def stream_agent(
                         sentence = await tts_queue.get()
                         if sentence is None:
                             break
-                        speech_text = voice_text_normalizer.normalize_sentence(sentence)
+                        speech_text = voice_text_normalizer.normalize_sentence(sentence, body.language)
                         if not speech_text:
                             continue
                         try:
@@ -268,8 +268,9 @@ async def stream_agent(
                     if sentence is None:
                         break
 
-                    # Normalize text for speech (strip markdown, emojis, special chars)
-                    speech_text = voice_text_normalizer.normalize_sentence(sentence)
+                    # Normalize text for speech (strip markdown, expand
+                    # numbers/dates in the target language, etc.)
+                    speech_text = voice_text_normalizer.normalize_sentence(sentence, body.language)
                     if not speech_text:
                         continue
 
@@ -533,7 +534,7 @@ async def stream_agent_ws(
             )
             for chunk in ready:
                 # Normalize text for natural speech output
-                speech_chunk = voice_text_normalizer.normalize_sentence(chunk)
+                speech_chunk = voice_text_normalizer.normalize_sentence(chunk, language)
                 if not speech_chunk:
                     continue
                 try:
@@ -625,7 +626,7 @@ async def stream_agent_ws(
                 else DEFAULT_MAX_CHUNK_WORDS
             )
             for chunk in sentence_buffer_service.split_for_tts(text_out, max_chunk_words=chunk_words):
-                speech_chunk = voice_text_normalizer.normalize_sentence(chunk)
+                speech_chunk = voice_text_normalizer.normalize_sentence(chunk, language)
                 if not speech_chunk:
                     continue
                 try:

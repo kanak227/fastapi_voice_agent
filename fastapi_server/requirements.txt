@@ -13,4 +13,10 @@ python-pptx>=1.0
 email-validator>=2.0
 python-multipart>=0.0.9
 
+# Voice text normalization: convert numbers/currency/dates to spoken words in
+# the target language before TTS. indic-numtowords covers Indian languages
+# (lakh/crore system); num2words covers English/European/CJK.
+num2words>=0.5.13
+indic-numtowords>=1.1.0
+
 
