@@ -51,6 +51,14 @@ DEFAULT_LANGUAGE = os.getenv("QWEN_DEFAULT_LANGUAGE", "english")
 SEED = int(os.getenv("QWEN_SEED", "1234"))
 API_KEY = os.getenv("TTS_API_KEY", "")  # optional, blank = no auth
 
+# Run the model in float32 weights but cast matmuls to fp16 at runtime via
+# torch.autocast. On a T4 (Turing) fp32 runs at ~8 TFLOPS while fp16 tensor
+# cores hit ~65 TFLOPS, so autocast gives a large speedup. Loading the weights
+# directly as fp16 (.half()) instead crashes this model with a CUDA
+# device-side assert, so autocast is the safe way to get tensor-core speed.
+USE_AUTOCAST = os.getenv("QWEN_AUTOCAST", "true").lower() in {"1", "true", "yes", "on"}
+AUTOCAST_DTYPE = torch.float16 if os.getenv("QWEN_AUTOCAST_DTYPE", "float16").lower() == "float16" else torch.bfloat16
+
 DTYPE_MAP = {
     "float16": torch.float16,
     "float32": torch.float32,
@@ -171,6 +179,14 @@ def _set_seed(seed: int) -> None:
 def _load_models() -> None:
     logger.info("Loading Qwen3-TTS %s on %s (dtype=%s)", QWEN_MODEL_ID, DEVICE, DTYPE_STR)
     _set_seed(SEED)
+
+    # Turing-era (T4) perf knobs: let cuDNN pick the fastest kernels and allow
+    # TF32 on matmuls. These are global and safe for inference.
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     app.state.qwen_model = Qwen3TTSModel.from_pretrained(
         QWEN_MODEL_ID,
         device_map=DEVICE,
@@ -182,18 +198,34 @@ def _load_models() -> None:
     app.state.mms_cache: dict[str, tuple] = {}
     app.state.mms_lock = threading.Lock()
     app.state.uroman = None  # lazy-init
-    logger.info("Qwen3-TTS ready. MMS engines will load on demand.")
+    logger.info(
+        "Qwen3-TTS ready (autocast=%s dtype=%s). MMS engines will load on demand.",
+        USE_AUTOCAST, str(AUTOCAST_DTYPE).replace("torch.", ""),
+    )
 
 
 def _qwen_synthesize(text: str, language: str, speaker: str = None) -> tuple[np.ndarray, int]:
     speaker = speaker or DEFAULT_VOICE_ID
+    use_amp = USE_AUTOCAST and DEVICE != "cpu"
     with app.state.qwen_lock:
         _set_seed(SEED)
-        wavs, sr = app.state.qwen_model.generate_custom_voice(
-            text=text,
-            speaker=speaker,
-            language=language,
-        )
+        # inference_mode disables autograd bookkeeping (faster + less memory
+        # than no_grad for pure inference). autocast runs matmuls in fp16 on
+        # the T4 tensor cores while keeping fp32 weights/activations elsewhere.
+        with torch.inference_mode():
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=AUTOCAST_DTYPE):
+                    wavs, sr = app.state.qwen_model.generate_custom_voice(
+                        text=text,
+                        speaker=speaker,
+                        language=language,
+                    )
+            else:
+                wavs, sr = app.state.qwen_model.generate_custom_voice(
+                    text=text,
+                    speaker=speaker,
+                    language=language,
+                )
     if not wavs:
         raise RuntimeError("Qwen3 returned empty audio")
     audio = wavs[0]
