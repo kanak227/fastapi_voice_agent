@@ -578,8 +578,7 @@ def _fastpitch_synthesize(text: str, lang_code: str, speaker: str = "female", my
     """Synthesize text using AI4Bharat FastPitch + HiFiGAN.
 
     Runs on CPU (fully parallel, RTF < 1.0) so it doesn't contend with
-    Qwen3 for the GPU. Handles punctuation natively — commas produce pauses,
-    periods produce sentence breaks.
+    Qwen3 for the GPU.
     """
     if my_seq is not None and not _is_current(my_seq):
         raise RequestSuperseded()
@@ -587,8 +586,16 @@ def _fastpitch_synthesize(text: str, lang_code: str, speaker: str = "female", my
     synth = _get_fastpitch(lang_code, speaker)
     sr = synth.output_sample_rate
 
-    # Synthesize (Coqui TTS handles text splitting internally)
-    wav = synth.tts(text, speaker_name=speaker)
+    # Pre-process text for FastPitch's limited vocabulary.
+    # The Hindi model has: 72 Devanagari chars + punctuation (! , - . : ; ?)
+    # It does NOT have: Latin letters, most digits (only 2,8), danda, markdown.
+    clean = _preprocess_for_fastpitch(text, lang_code)
+
+    if not clean:
+        raise RuntimeError("FastPitch: text is empty after preprocessing")
+
+    # Synthesize (Coqui TTS handles sentence splitting internally via pysbd)
+    wav = synth.tts(clean, speaker_name=speaker)
 
     if my_seq is not None and not _is_current(my_seq):
         raise RequestSuperseded()
@@ -598,6 +605,68 @@ def _fastpitch_synthesize(text: str, lang_code: str, speaker: str = "female", my
         raise RuntimeError(f"FastPitch produced empty audio for lang={lang_code}")
 
     return audio, sr
+
+
+# Regex to find runs of Latin characters (English words in Hindi text)
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]+")
+# Regex to find remaining digit sequences (should be rare after backend normalization)
+_DIGIT_RE = re.compile(r"\d+")
+
+# Hindi digit words for any digits that slip through
+_HINDI_DIGITS = ["शून्य", "एक", "दो", "तीन", "चार", "पाँच", "छः", "सात", "आठ", "नौ"]
+
+
+def _digits_to_hindi_words(match: re.Match) -> str:
+    """Convert a digit sequence to Hindi digit words (digit by digit for short,
+    or as a number word for longer sequences)."""
+    digits = match.group(0)
+    # Read digit by digit (safest for any remaining numbers)
+    return " ".join(_HINDI_DIGITS[int(d)] for d in digits)
+
+
+def _preprocess_for_fastpitch(text: str, lang_code: str) -> str:
+    """Comprehensive text preprocessing for FastPitch Indian language models.
+
+    Handles:
+    - Hindi danda/double danda → period (for sentence pauses)
+    - Em-dash, en-dash → comma (for clause pauses)
+    - English words → Devanagari transliteration
+    - Remaining digits → Hindi number words
+    - Markdown/symbols → stripped
+    - Unsupported punctuation → mapped to supported equivalents
+    """
+    clean = text
+
+    # 1. Map unsupported punctuation to supported equivalents
+    clean = clean.replace("\u0964", ".")   # । (danda) -> period
+    clean = clean.replace("\u0965", ".")   # ॥ (double danda) -> period
+    clean = clean.replace("\u2014", ",")   # — (em-dash) -> comma
+    clean = clean.replace("\u2013", ",")   # – (en-dash) -> comma
+    clean = clean.replace("\u2026", ".")   # … -> period
+    clean = clean.replace('"', "'")        # smart quotes -> apostrophe
+    clean = clean.replace('\u201c', "'")
+    clean = clean.replace('\u201d', "'")
+    clean = clean.replace('\u2018', "'")
+    clean = clean.replace('\u2019', "'")
+    clean = clean.replace('`', "'")
+
+    # 2. Strip markdown and symbols not in vocab
+    clean = re.sub(r"[#*_~\[\]{}|\\@&%$₹€£¥+=<>^/]", "", clean)
+
+    # 3. Remove English words entirely (FastPitch Hindi has no Latin chars).
+    # The backend normalizer should have already converted important English
+    # terms, but any that slip through are simply stripped so speech flows
+    # without gaps or artifacts.
+    if lang_code in ("hi", "ta", "te", "mr", "bn", "gu", "kn", "ml", "pa"):
+        clean = _LATIN_WORD_RE.sub("", clean)
+
+    # 4. Convert any remaining digits to spoken words
+    clean = _DIGIT_RE.sub(_digits_to_hindi_words, clean)
+
+    # 5. Collapse whitespace
+    clean = re.sub(r"\s+", " ", clean).strip()
+
+    return clean
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +680,6 @@ def _check_auth(xi_api_key: Optional[str]) -> None:
 
 
 # Backward-compat: map old MMS voice IDs to new FastPitch voice IDs.
-# The frontend may still send "mms-hindi" etc. from cached configs.
 _VOICE_COMPAT_MAP: dict[str, str] = {
     "mms-hindi": "indic-hindi-female",
     "mms-tamil": "indic-tamil-female",
@@ -624,6 +692,13 @@ _VOICE_COMPAT_MAP: dict[str, str] = {
     "mms-punjabi": "indic-punjabi-female",
 }
 
+# Map indic voice IDs to their FastPitch language code for voice-based routing.
+_INDIC_VOICE_TO_LANG: dict[str, str] = {}
+for _v in VOICE_CATALOG:
+    if _v["voice_id"].startswith("indic-"):
+        # "indic-hindi-female" -> "hi" (first language in the voice's list)
+        _INDIC_VOICE_TO_LANG[_v["voice_id"]] = _v["languages"][0].lower().split("-")[0]
+
 
 def _resolve_voice(voice_id: str) -> str:
     vid = (voice_id or "").strip()
@@ -635,6 +710,17 @@ def _resolve_voice(voice_id: str) -> str:
         if v["voice_id"] == vid:
             return v["voice_id"]
     return DEFAULT_VOICE_ID
+
+
+def _override_engine_by_voice(engine: str, arg: str, preprocess, voice: str):
+    """If the resolved voice is an indic-* voice, force FastPitch engine
+    regardless of what language_code said. This handles cases where the
+    frontend sends voice_id=indic-hindi-female with language_code=en."""
+    if voice in _INDIC_VOICE_TO_LANG:
+        lang = _INDIC_VOICE_TO_LANG[voice]
+        fp_lang = FASTPITCH_LANG_MAP.get(lang, lang)
+        return "fastpitch", fp_lang, preprocess
+    return engine, arg, preprocess
 
 
 def _route_engine(language_code: Optional[str]) -> tuple[str, str, str | None]:
@@ -754,6 +840,8 @@ def text_to_speech(
 
     engine, arg, preprocess = _route_engine(body.language_code)
     voice = _resolve_voice(voice_id)
+    # Override engine if voice is an indic-* voice (handles mismatched language_code)
+    engine, arg, preprocess = _override_engine_by_voice(engine, arg, preprocess, voice)
     # Claim a generation: this supersedes any older in-flight synthesis, which
     # will abort at its next chunk boundary and release the GPU.
     my_seq = _claim_request()
@@ -823,6 +911,8 @@ def text_to_speech_stream(
 
     engine, arg, preprocess = _route_engine(body.language_code)
     voice = _resolve_voice(voice_id)
+    # Override engine if voice is an indic-* voice (handles mismatched language_code)
+    engine, arg, preprocess = _override_engine_by_voice(engine, arg, preprocess, voice)
     # Claim a generation so this stream supersedes any older in-flight request.
     my_seq = _claim_request()
     logger.info("stream seq=%d engine=%s arg=%s voice=%s preprocess=%s len=%d", my_seq, engine, arg, voice, preprocess, len(text))
