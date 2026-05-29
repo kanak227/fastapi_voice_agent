@@ -93,7 +93,7 @@ MMS_LANG_MAP: dict[str, str] = {
     "kn": "kan",
     "ml": "mal",
     "pa": "pan",
-    "ur": "urd",
+    "ur": "urd-script_arabic",  # Urdu MMS ships only as the Arabic-script checkpoint
     "ar": "ara",
 }
 
@@ -103,7 +103,11 @@ MMS_LANG_MAP: dict[str, str] = {
 # speaker per language) but we still expose names for UI consistency.
 VOICE_CATALOG: list[dict] = [
     {"voice_id": "serena", "name": "Serena", "labels": {"gender": "female", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
-    {"voice_id": "ethan", "name": "Ethan", "labels": {"gender": "male", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
+    {"voice_id": "vivian", "name": "Vivian", "labels": {"gender": "female", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
+    {"voice_id": "ryan", "name": "Ryan", "labels": {"gender": "male", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
+    {"voice_id": "aiden", "name": "Aiden", "labels": {"gender": "male", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
+    {"voice_id": "eric", "name": "Eric", "labels": {"gender": "male", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
+    {"voice_id": "dylan", "name": "Dylan", "labels": {"gender": "male", "accent": "neutral"}, "languages": ["en", "fr", "de", "es", "it", "pt", "ru", "ja", "ko", "zh"]},
     {"voice_id": "mms-hindi", "name": "Hindi (MMS)", "labels": {"gender": "neutral", "accent": "hindi"}, "languages": ["hi", "hi-Latn"]},
     {"voice_id": "mms-tamil", "name": "Tamil (MMS)", "labels": {"gender": "neutral", "accent": "tamil"}, "languages": ["ta"]},
     {"voice_id": "mms-telugu", "name": "Telugu (MMS)", "labels": {"gender": "neutral", "accent": "telugu"}, "languages": ["te"]},

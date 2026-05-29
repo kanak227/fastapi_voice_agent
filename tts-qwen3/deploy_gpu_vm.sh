@@ -52,8 +52,16 @@ gcloud compute firewall-rules create allow-qwen-tts \
     --description="Qwen3 TTS API" || true
 
 # 4. Start the container on the VM.
+#    The cu129 Deep Learning VM image does NOT ship Docker preinstalled, so
+#    install it (plus the NVIDIA container runtime) if it's missing.
 gcloud compute ssh "${INSTANCE}" --project="${PROJECT}" --zone="${ZONE}" --command "
 set -e
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+  sudo sh /tmp/get-docker.sh
+  sudo nvidia-ctk runtime configure --runtime=docker
+  sudo systemctl restart docker
+fi
 sudo gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 sudo docker pull ${IMAGE_TAG}
 sudo docker rm -f qwen3-tts || true

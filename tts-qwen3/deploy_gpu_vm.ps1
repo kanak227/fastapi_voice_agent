@@ -76,6 +76,16 @@ for i in {1..60}; do
   if nvidia-smi >/dev/null 2>&1; then break; fi
   sleep 5
 done
+
+# The cu129 Deep Learning VM image does NOT ship Docker preinstalled.
+# Install it on first boot, then wire up the NVIDIA container runtime.
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+  sh /tmp/get-docker.sh
+  nvidia-ctk runtime configure --runtime=docker
+  systemctl restart docker
+fi
+
 gcloud auth configure-docker $Region-docker.pkg.dev --quiet
 docker pull $ImageTag
 docker rm -f qwen3-tts >/dev/null 2>&1 || true
