@@ -254,6 +254,18 @@ def _load_models() -> None:
 
     logger.info("FasterQwen3TTS ready. MMS engines will load on demand.")
 
+    # Pre-load FastPitch models for the most-used Indian languages so the
+    # first real request doesn't pay the ~10s model-load cost.
+    _PRELOAD_LANGS = os.getenv("FASTPITCH_PRELOAD", "hi,ta,te,bn,mr").split(",")
+    for lang in _PRELOAD_LANGS:
+        lang = lang.strip()
+        if lang and lang in FASTPITCH_LANG_MAP:
+            try:
+                _get_fastpitch(lang, "female")
+                logger.info("FastPitch %s preloaded.", lang)
+            except Exception as exc:
+                logger.warning("FastPitch %s preload failed (will lazy-load): %s", lang, exc)
+
 
 class RequestSuperseded(Exception):
     """Raised when a newer TTS request arrives and this one should abort."""
@@ -557,7 +569,7 @@ def _get_fastpitch(lang_code: str, speaker: str = "female"):
 
 def _resolve_fastpitch_speaker(voice_id: str) -> str:
     """Extract speaker gender from voice_id like 'indic-hindi-male' -> 'male'."""
-    if voice_id and "male" in voice_id:
+    if voice_id and voice_id.endswith("-male"):
         return "male"
     return "female"
 
