@@ -1,17 +1,23 @@
 /**
  * Shared audio chunk player for the voice pipeline.
  *
- * The realtime backend streams many small (~1s) WAV windows. Playing each one
- * through a separate HTMLAudioElement leaves an audible gap at every boundary
- * ("speaks-cuts-speaks-cuts") because element handoff isn't sample-accurate.
+ * The realtime backend streams many small WAV windows. Playing each through a
+ * separate HTMLAudioElement leaves audible gaps; even a just-in-time Web Audio
+ * scheduler stutters because windows arrive with jitter and multi-second gaps
+ * between sentences.
  *
- * So we schedule every window on ONE shared Web Audio timeline (see
- * gapless-player.js), each clip starting exactly where the previous ended.
- * This plays the stream seamlessly. We fall back to HTMLAudioElement only if
- * Web Audio is unavailable.
+ * So we hand every window to a PREBUFFERED gapless scheduler (gapless-player.js)
+ * that decodes + queues windows and only starts playback once a small cushion
+ * exists, then renders them contiguously on one timeline. We fall back to
+ * HTMLAudioElement only if Web Audio is unavailable.
  */
 
-import { scheduleChunk, stopGapless } from "@/lib/gapless-player.js";
+import {
+  scheduleChunk,
+  stopGapless,
+  whenGaplessIdle,
+  flushGapless,
+} from "@/lib/gapless-player.js";
 
 function hasWebAudio() {
   return (
@@ -21,43 +27,31 @@ function hasWebAudio() {
 }
 
 /**
- * Play one audio chunk.
+ * Enqueue one audio window for gapless playback.
  *
- * @param {object} chunk        - chunk descriptor from voice-streaming
+ * @param {object} chunk
  * @param {string} chunk.audio_b64
- * @param {string} [chunk.mime_type]  - defaults to audio/mpeg
- * @param {HTMLAudioElement} [chunk._preloaded] - prefetched element (HTML fallback only)
+ * @param {string} [chunk.mime_type]
  * @param {object} [opts]
- * @param {() => boolean} [opts.shouldAbort]    - called before play; true cancels
+ * @param {() => boolean} [opts.shouldAbort]
  * @param {(audio: HTMLAudioElement|null) => void} [opts.onPlay]
- *        - called once playback/scheduling starts. For the gapless path there
- *          is no HTMLAudioElement, so we pass null.
  */
 export async function playAudioChunk(chunk, opts = {}) {
   if (!chunk?.audio_b64) return;
   if (opts.shouldAbort?.()) return;
 
-  // Preferred path: gapless Web Audio scheduling. scheduleChunk resolves once
-  // the window is scheduled (right after the previous one), so consecutive
-  // windows queue back-to-back with no gap.
   if (hasWebAudio()) {
+    // Just decode + enqueue. The prebuffered pump handles pacing/scheduling,
+    // so we return quickly and let the caller feed the next window. This keeps
+    // the queue ahead of the playhead and absorbs arrival jitter.
     const res = await scheduleChunk(chunk.audio_b64, chunk.mime_type);
     if (res) {
-      // No HTMLAudioElement in this path; signal "playing" so callers that
-      // track an active element for stop-buttons still update their phase.
       opts.onPlay?.(null);
-      // Resolve roughly when this window finishes so the caller's playChain
-      // stays paced with audio (prevents scheduling thousands of clips at once
-      // and lets abort checks run between windows). We cap the wait so a
-      // dropped window can't stall the chain.
-      const waitMs = Math.min(Math.max(res.duration * 1000, 50), 4000);
-      await new Promise((r) => setTimeout(r, waitMs));
       return;
     }
-    // fall through to HTML audio if scheduling failed
+    // fall through to HTML audio if decode failed
   }
 
-  // Fallback: HTMLAudioElement (older browsers / decode failure).
   const audio =
     chunk._preloaded ||
     new Audio(`data:${chunk.mime_type || "audio/mpeg"};base64,${chunk.audio_b64}`);
@@ -80,6 +74,22 @@ export async function playAudioChunk(chunk, opts = {}) {
       .then(() => { opts.onPlay?.(audio); })
       .catch(finish);
   });
+}
+
+/**
+ * Wait until all enqueued/scheduled gapless audio has finished playing.
+ * Call this after the SSE stream ends so the turn doesn't resolve while audio
+ * is still in the buffer.
+ */
+export async function waitForAudioToFinish() {
+  if (!hasWebAudio()) return;
+  try { await whenGaplessIdle(); } catch { /* ignore */ }
+}
+
+/** Start playback of whatever is queued even if the prebuffer wasn't reached. */
+export function flushAudioPlayback() {
+  if (!hasWebAudio()) return;
+  try { flushGapless(); } catch { /* ignore */ }
 }
 
 /** Stop any gapless audio currently scheduled/playing. */

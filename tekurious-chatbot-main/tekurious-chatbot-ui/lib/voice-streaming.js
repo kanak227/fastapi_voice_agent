@@ -1,5 +1,6 @@
 import { createParser } from "@/app/api/eventsource-parser.js";
 import { getCurrentTtsSettings } from "@/lib/tts-settings.js";
+import { waitForAudioToFinish, flushAudioPlayback } from "@/lib/audio-playback.js";
 
 function normalizeVoiceErrorMessage(reason) {
   const text = String(reason || "").trim();
@@ -172,8 +173,11 @@ export async function streamRecordedVoiceTurn({
         if (fallbackText) { finalText = fallbackText; onFinalText?.(fallbackText); }
       }
 
-      // Wait for all queued audio to finish playing
+      // Stream ended. Flush any queued audio that's below the prebuffer
+      // threshold, then wait for the gapless player to finish playing it out.
       await playChain;
+      flushAudioPlayback();
+      await waitForAudioToFinish();
     } catch (err) {
       // AbortError is expected when user stops playback
       if (err.name !== "AbortError") throw err;

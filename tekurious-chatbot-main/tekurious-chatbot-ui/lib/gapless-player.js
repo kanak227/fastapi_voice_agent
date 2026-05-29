@@ -1,23 +1,32 @@
 /**
- * Gapless audio scheduler for the realtime voice pipeline.
+ * Prebuffered gapless audio scheduler for the realtime voice pipeline.
  *
- * The backend streams many small (~1s) WAV windows as the TTS model renders
- * them. Playing each one through a separate HTMLAudioElement leaves an audible
- * gap at every boundary ("speaks-cuts-speaks-cuts"), because each element has
- * start latency and the onended -> next .play() handoff is not sample-accurate.
+ * The backend streams many small WAV windows as the TTS model renders them.
+ * Two things make naive playback stutter:
+ *   1. Windows arrive with jitter (e.g. +0.66s then +1.32s for ~1s of audio),
+ *      so a just-in-time scheduler underruns and clicks mid-sentence.
+ *   2. Between sentences the LLM pauses, leaving multi-second arrival gaps.
  *
- * Instead we decode every window into an AudioBuffer and schedule it on ONE
- * shared AudioContext timeline, each clip starting exactly where the previous
- * one ends (a running `nextStartAt` cursor). The Web Audio engine then plays
- * them as one continuous stream with no gaps.
+ * To stay smooth we behave like a media player: decode each window into an
+ * AudioBuffer, queue it, and only START playback once a PREBUFFER cushion is
+ * ready. Once playing, every window is scheduled exactly where the previous
+ * one ends (a running `nextStartAt` cursor) so the Web Audio engine renders
+ * one continuous stream. If the buffer drains (a long LLM gap), we re-enter
+ * buffering and resume cleanly instead of glitching.
  *
- * Ordering: callers MUST invoke `scheduleChunk` in audio order and await it
- * (the voice pipeline already serializes via its playChain), so the cursor
- * advances in order and windows never overlap or shuffle.
+ * Ordering: callers MUST enqueue windows in audio order (the voice pipeline
+ * serializes via its playChain), so the queue and cursor stay in order.
  */
 
+const PREBUFFER_SEC = 2.0;   // cushion before first sound (absorbs jitter)
+const REBUFFER_SEC = 1.2;    // cushion required to resume after an underrun
+
 let ctx = null;
-let nextStartAt = 0;
+let nextStartAt = 0;          // AudioContext time where the next clip should start
+let queue = [];               // decoded AudioBuffers waiting to be scheduled
+let buffered = 0;             // seconds of audio currently queued (not yet scheduled)
+let started = false;          // have we begun playback for this turn?
+let draining = false;         // pump loop running?
 const activeSources = new Set();
 
 function getCtx() {
@@ -39,71 +48,144 @@ function b64ToArrayBuffer(b64) {
   return bytes.buffer;
 }
 
+function _scheduleBuffer(c, audioBuffer) {
+  const src = c.createBufferSource();
+  src.buffer = audioBuffer;
+  src.connect(c.destination);
+  // Keep the cursor ahead of the playhead; if it fell behind (underrun), start
+  // a hair in the future so the first sample isn't clipped.
+  const startAt = Math.max(c.currentTime + 0.02, nextStartAt);
+  try {
+    src.start(startAt);
+  } catch {
+    return;
+  }
+  nextStartAt = startAt + audioBuffer.duration;
+  activeSources.add(src);
+  src.onended = () => { activeSources.delete(src); };
+}
+
 /**
- * Decode one window and schedule it immediately after the previously
- * scheduled audio. Resolves once the clip is scheduled (not when it finishes),
- * so the caller can quickly schedule the next window ahead of the playhead.
+ * Pump loop: schedules queued buffers contiguously while keeping a cushion.
+ * Starts only after PREBUFFER_SEC is available, then drains the queue. If the
+ * queue empties mid-turn it waits for REBUFFER_SEC before resuming.
+ */
+async function _pump() {
+  if (draining) return;
+  draining = true;
+  const c = getCtx();
+  if (!c) { draining = false; return; }
+  if (c.state === "suspended") { try { await c.resume(); } catch {} }
+
+  try {
+    while (true) {
+      // Need an initial cushion before the very first clip.
+      if (!started && buffered < PREBUFFER_SEC && queue.length > 0) {
+        // wait for more windows unless the turn is clearly tiny (handled on finalize)
+        await new Promise((r) => setTimeout(r, 60));
+        if (!queue.length && !started) { /* nothing yet */ }
+        continue;
+      }
+      if (queue.length === 0) {
+        // Drained. If we were playing and the playhead has caught up, pause
+        // (re-buffer) until new audio arrives.
+        if (started && c.currentTime >= nextStartAt - 0.05) {
+          started = false; // require REBUFFER before next start
+        }
+        break; // nothing to schedule right now; new enqueues will re-pump
+      }
+
+      // If resuming after an underrun, wait for a small cushion again.
+      if (!started && buffered < REBUFFER_SEC && queue.length > 0) {
+        // allow start if this is the tail (no more coming) — finalize() flushes
+        await new Promise((r) => setTimeout(r, 60));
+        continue;
+      }
+
+      const buf = queue.shift();
+      buffered -= buf.duration;
+      if (!started) {
+        started = true;
+        // anchor the timeline slightly ahead of now for the first clip
+        nextStartAt = Math.max(nextStartAt, c.currentTime + 0.05);
+      }
+      _scheduleBuffer(c, buf);
+    }
+  } finally {
+    draining = false;
+  }
+}
+
+/**
+ * Decode + enqueue one window. Resolves quickly (after decode), so the caller
+ * can feed the next window. Playback pacing is handled by the pump loop.
  *
- * @param {string} audioB64 base64-encoded WAV (or any format decodeAudioData supports)
- * @returns {Promise<{startAt:number,duration:number}|null>}
+ * @param {string} audioB64 base64 WAV
+ * @returns {Promise<{duration:number}|null>}
  */
 export async function scheduleChunk(audioB64 /*, mimeType */) {
   const c = getCtx();
   if (!c || !audioB64) return null;
-  if (c.state === "suspended") {
-    try { await c.resume(); } catch { /* ignore */ }
-  }
+  if (c.state === "suspended") { try { await c.resume(); } catch {} }
 
   let audioBuffer;
   try {
-    // decodeAudioData wants its own ArrayBuffer copy; slice() guards against
-    // detached-buffer reuse across calls.
     audioBuffer = await c.decodeAudioData(b64ToArrayBuffer(audioB64).slice(0));
   } catch {
-    return null; // skip an undecodable window rather than break the stream
+    return null; // skip undecodable window
   }
 
-  const src = c.createBufferSource();
-  src.buffer = audioBuffer;
-  src.connect(c.destination);
-
-  // Never schedule in the past. A tiny lead avoids glitches when the cursor
-  // has already been consumed (first chunk, or after an underrun).
-  const now = c.currentTime;
-  const startAt = Math.max(now + 0.03, nextStartAt);
-  try {
-    src.start(startAt);
-  } catch {
-    return null;
-  }
-  nextStartAt = startAt + audioBuffer.duration;
-
-  activeSources.add(src);
-  src.onended = () => { activeSources.delete(src); };
-
-  return { startAt, duration: audioBuffer.duration };
+  queue.push(audioBuffer);
+  buffered += audioBuffer.duration;
+  _pump();
+  return { duration: audioBuffer.duration };
 }
 
-/** Stop everything currently scheduled/playing and reset the timeline. */
+/**
+ * Force-start playback even if the prebuffer threshold wasn't reached (called
+ * when the turn has ended and no more windows are coming, so a short reply
+ * isn't held back waiting for a cushion it will never get).
+ */
+export function flushGapless() {
+  started = false; // let pump start with whatever is queued
+  // Temporarily allow start by faking enough buffer via direct pump with low bar:
+  // simplest: if there is anything queued, mark as startable.
+  if (queue.length > 0) {
+    // lower the bar: pump treats started transition; emulate by setting buffered
+    // high enough to pass thresholds for this drain.
+    buffered = Math.max(buffered, PREBUFFER_SEC);
+  }
+  _pump();
+}
+
+/** Stop everything and reset for the next turn. */
 export function stopGapless() {
   for (const s of activeSources) {
-    try { s.onended = null; s.stop(); } catch { /* ignore */ }
-    try { s.disconnect(); } catch { /* ignore */ }
+    try { s.onended = null; s.stop(); } catch {}
+    try { s.disconnect(); } catch {}
   }
   activeSources.clear();
+  queue = [];
+  buffered = 0;
+  started = false;
+  draining = false;
   if (ctx) nextStartAt = ctx.currentTime;
 }
 
-/** Resolve when all scheduled audio has finished playing. */
+/** Resolve when all queued + scheduled audio has finished playing. */
 export async function whenGaplessIdle() {
   const c = ctx;
   if (!c) return;
-  // Wait until the playhead passes the last scheduled end (or everything stopped).
-  while (activeSources.size > 0 && c.currentTime < nextStartAt - 0.05) {
-    await new Promise((r) => setTimeout(r, 80));
+  // Make sure anything still queued gets played out.
+  flushGapless();
+  while (
+    (queue.length > 0 || activeSources.size > 0 || c.currentTime < nextStartAt - 0.05)
+  ) {
+    await new Promise((r) => setTimeout(r, 100));
+    if (queue.length === 0 && activeSources.size === 0) break;
   }
 }
 
 export function isGaplessActive() {
-  return activeSources.size > 0;
+  return activeSources.size > 0 || queue.length > 0;
 }
