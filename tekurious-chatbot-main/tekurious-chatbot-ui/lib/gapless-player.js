@@ -87,11 +87,8 @@ async function _pump() {
         continue;
       }
       if (queue.length === 0) {
-        // Drained. If we were playing and the playhead has caught up, pause
-        // (re-buffer) until new audio arrives.
-        if (started && c.currentTime >= nextStartAt - 0.05) {
-          started = false; // require REBUFFER before next start
-        }
+        // Drained. DO NOT stop playback if already started - keep the stream open
+        // for more chunks to arrive. Only break to wait for more audio.
         break; // nothing to schedule right now; new enqueues will re-pump
       }
 
@@ -178,11 +175,16 @@ export async function whenGaplessIdle() {
   if (!c) return;
   // Make sure anything still queued gets played out.
   flushGapless();
-  while (
-    (queue.length > 0 || activeSources.size > 0 || c.currentTime < nextStartAt - 0.05)
-  ) {
+  // Wait for all audio to finish - don't break early
+  while (queue.length > 0 || activeSources.size > 0) {
     await new Promise((r) => setTimeout(r, 100));
-    if (queue.length === 0 && activeSources.size === 0) break;
+  }
+  // Give a tiny grace period for the last audio to truly finish
+  if (c && c.currentTime < nextStartAt) {
+    const remaining = Math.max(0, (nextStartAt - c.currentTime) * 1000);
+    if (remaining > 0 && remaining < 5000) {
+      await new Promise((r) => setTimeout(r, remaining + 50));
+    }
   }
 }
 

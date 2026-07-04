@@ -14,7 +14,7 @@ import { useEffect, useState } from "react";
 const STORAGE_KEY = "tekurious.tts.settings.v1";
 
 const DEFAULTS = Object.freeze({
-  provider: "elevenlabs", // "elevenlabs" (online) | "qwen" (offline)
+  provider: "qwen", // "elevenlabs" (online) | "qwen" (offline) - Default to qwen for Indian voices
   voiceId: "",            // empty = backend default
 });
 

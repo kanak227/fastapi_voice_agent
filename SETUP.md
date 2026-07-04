@@ -2,6 +2,36 @@
 
 This guide explains exactly what a new user must configure after cloning this repository.
 
+---
+
+## 💰 Cost Control (GCP Deployment)
+
+**If you're running on GCP**, you can save ~$190-255/month by stopping high-cost services when not in use!
+
+### Quick Commands
+
+**Stop high-cost services** (saves ~$6-8/day):
+```powershell
+.\deployment\gcp\stop-services.ps1
+```
+
+**Start high-cost services** (ready in 60 seconds):
+```powershell
+.\deployment\gcp\start-services.ps1
+```
+
+**Check current cost**:
+```powershell
+.\deployment\gcp\check-status.ps1
+```
+
+**What gets stopped**: Backend (~$50-100/mo) + TTS VM (~$155/mo)  
+**What stays running**: Frontend (~$0-10/mo, already scales to zero)
+
+📖 **See**: `💰_SAVE_MONEY.md` for complete details
+
+---
+
 ## 1) Prerequisites
 
 - Python 3.11+ (for backend and bot services)

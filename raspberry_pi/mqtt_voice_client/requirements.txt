@@ -1,0 +1,16 @@
+# Core dependencies
+requests>=2.31.0
+
+# Audio backends (choose one or more based on your platform)
+# Option 1: sounddevice (recommended, cross-platform, pure Python)
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Option 2: pyaudio (cross-platform, requires C extension)
+# PyAudio>=0.2.13
+
+# Option 3: alsaaudio (Linux native ALSA, lightweight)
+# pyalsaaudio>=0.9.2
+
+# Optional: For MQTT integration (future)
+# paho-mqtt>=1.6.1

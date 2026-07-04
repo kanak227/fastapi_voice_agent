@@ -18,6 +18,7 @@ from app.routers.status import router as status_router
 from app.routers.voice import router as voice_router
 from app.routers.documents import router as documents_router
 from app.routers.knowledge import router as knowledge_router
+from app.routers.mqtt_bridge import router as mqtt_router
 from app.services.runtime_clients import runtime_clients
 from app.services.retrieval_cache_service import retrieval_cache_service
 
@@ -92,6 +93,7 @@ def create_app() -> FastAPI:
     application.include_router(status_router)
     application.include_router(documents_router)
     application.include_router(knowledge_router)
+    application.include_router(mqtt_router)
     application.include_router(health_router)
 
     # Register here (not only on APIRouter) so these paths always match this app —

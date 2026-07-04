@@ -119,7 +119,8 @@ export default function Dashboard() {
   };
 
   const playBase64Audio = async (audioB64, mimeType = 'audio/mpeg') => {
-    if (voiceAbortRef.current) return; // Skip if speech was stopped
+    // Don't skip audio if voiceAbortRef is true - reset it first if needed
+    // The abort flag should only apply to the current playing audio, not future audio
     const audio = new Audio(`data:${mimeType};base64,${audioB64}`);
     currentAudioRef.current = audio;
     await new Promise((resolve) => {
@@ -259,8 +260,6 @@ export default function Dashboard() {
           }
         },
         onAudioChunk: async (chunk) => {
-          if (voiceAbortRef.current) return;
-          // Play audio (normalized text) concurrently while text streams
           setVoicePhase('speaking');
           await playAudioChunk(chunk, {
             shouldAbort: () => voiceAbortRef.current,

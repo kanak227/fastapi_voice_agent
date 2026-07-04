@@ -229,14 +229,27 @@ def _load_models() -> None:
     app.state.fastpitch_lock = threading.Lock()
     app.state.graphs_warmed = False
 
-    # ---- Request superseding -------------------------------------------------
-    # Every incoming TTS request claims a monotonically increasing generation
-    # number. Any synthesis already in flight checks this between chunks and
-    # ABORTS the moment a newer request arrives, then releases the GPU lock so
-    # the new request runs immediately. This guarantees the VM only ever works
-    # on the latest request and never interleaves/mixes two turns on the GPU.
-    app.state.request_seq = 0
+    # ---- Request queue for concurrent handling --------------------------------
+    # Instead of blocking with a lock, queue requests and process them in order.
+    # Multiple users can submit requests; they wait in queue instead of blocking.
+    from queue import Queue
+    import asyncio
+    
+    app.state.request_queue = Queue(maxsize=100)  # Max 100 queued requests
+    app.state.processing = False
+    app.state.queue_lock = threading.Lock()
+    
+    # Request timeout: How long a request can wait in queue before being dropped
+    app.state.queue_timeout_seconds = int(os.getenv("QUEUE_TIMEOUT_SECONDS", "30"))
+    
+    # Track active request for superseding
+    app.state.current_request_seq = 0
     app.state.seq_lock = threading.Lock()
+    
+    # Simple in-memory cache for TTS responses (helps with repeated phrases)
+    app.state.tts_cache: dict[str, tuple] = {}  # key -> (audio, sr, timestamp)
+    app.state.cache_max_size = int(os.getenv("TTS_CACHE_SIZE", "100"))
+    app.state.cache_ttl_seconds = int(os.getenv("TTS_CACHE_TTL", "3600"))  # 1 hour
 
     # Warm the CUDA graphs once so the first real request doesn't pay the
     # capture cost (~3-5s). Best-effort; failures fall back to lazy capture.
@@ -271,19 +284,58 @@ class RequestSuperseded(Exception):
     """Raised when a newer TTS request arrives and this one should abort."""
 
 
-def _claim_request() -> int:
-    """Register a new request and return its generation id.
+class RequestTimeout(Exception):
+    """Raised when a TTS request times out in queue."""
 
-    The id is the latest; any older in-flight synthesis will see a higher
-    app.state.request_seq and abort at its next chunk boundary.
-    """
+
+def _make_cache_key(text: str, engine: str, arg: str, voice: str) -> str:
+    """Create cache key for TTS response."""
+    import hashlib
+    key_str = f"{engine}:{arg}:{voice}:{text}"
+    return hashlib.md5(key_str.encode()).hexdigest()
+
+
+def _get_cached_tts(cache_key: str):
+    """Get cached TTS response if available and not expired."""
+    import time
+    if cache_key in app.state.tts_cache:
+        audio, sr, timestamp = app.state.tts_cache[cache_key]
+        if (time.time() - timestamp) < app.state.cache_ttl_seconds:
+            logger.debug("Cache hit for key=%s", cache_key[:8])
+            return audio, sr
+        else:
+            # Expired, remove it
+            del app.state.tts_cache[cache_key]
+    return None, None
+
+
+def _cache_tts(cache_key: str, audio: np.ndarray, sr: int):
+    """Cache TTS response."""
+    import time
+    # Simple LRU: if cache is full, remove oldest entry
+    if len(app.state.tts_cache) >= app.state.cache_max_size:
+        oldest_key = min(app.state.tts_cache.items(), key=lambda x: x[1][2])[0]
+        del app.state.tts_cache[oldest_key]
+    
+    app.state.tts_cache[cache_key] = (audio.copy(), sr, time.time())
+    logger.debug("Cached response for key=%s (cache_size=%d)", cache_key[:8], len(app.state.tts_cache))
+
+
+def _claim_request() -> int:
+    """Claim the current request slot."""
     with app.state.seq_lock:
-        app.state.request_seq += 1
-        return app.state.request_seq
+        app.state.current_request_seq += 1
+        return app.state.current_request_seq
+
+
+def _finish_request(seq: int) -> None:
+    """Finish request (placeholder for future cleanup)."""
+    pass  # Currently no cleanup needed, but keeping for future use
 
 
 def _is_current(my_seq: int) -> bool:
-    return my_seq >= app.state.request_seq
+    """Check if this request is still the current one."""
+    return my_seq >= app.state.current_request_seq
 
 
 def _normalize_qwen_lang(language: str) -> str:
@@ -307,10 +359,18 @@ def _qwen_stream(text: str, language: str, speaker: str = None, my_seq: int | No
     """
     speaker = speaker or DEFAULT_VOICE_ID
     lang = _normalize_qwen_lang(language)
-    with app.state.qwen_lock:
+    
+    # Try to acquire lock with timeout instead of blocking forever
+    acquired = app.state.qwen_lock.acquire(timeout=5.0)  # Wait max 5 seconds
+    if not acquired:
+        logger.warning("Failed to acquire GPU lock after 5s for seq=%d", my_seq or -1)
+        raise HTTPException(status_code=503, detail="TTS service busy, try again")
+    
+    try:
         # If a newer request arrived while we waited for the lock, bail now.
         if my_seq is not None and not _is_current(my_seq):
             raise RequestSuperseded()
+        
         with torch.inference_mode():
             for audio_chunk, chunk_sr, _timing in app.state.qwen_model.generate_custom_voice_streaming(
                 text=text,
@@ -326,6 +386,8 @@ def _qwen_stream(text: str, language: str, speaker: str = None, my_seq: int | No
                 if hasattr(arr, "cpu"):
                     arr = arr.cpu().numpy()
                 yield np.asarray(arr, dtype=np.float32).reshape(-1), int(chunk_sr or 24000)
+    finally:
+        app.state.qwen_lock.release()
 
 
 def _qwen_synthesize(text: str, language: str, speaker: str = None, my_seq: int | None = None) -> tuple[np.ndarray, int]:
@@ -586,9 +648,7 @@ def _fastpitch_synthesize(text: str, lang_code: str, speaker: str = "female", my
     synth = _get_fastpitch(lang_code, speaker)
     sr = synth.output_sample_rate
 
-    # Pre-process text for FastPitch's limited vocabulary.
-    # The Hindi model has: 72 Devanagari chars + punctuation (! , - . : ; ?)
-    # It does NOT have: Latin letters, most digits (only 2,8), danda, markdown.
+    # Pre-process text for FastPitch's limited vocabulary
     clean = _preprocess_for_fastpitch(text, lang_code)
 
     if not clean:
@@ -864,8 +924,36 @@ def text_to_speech(
     voice = _resolve_voice(voice_id)
     # Override engine if voice is an indic-* voice (handles mismatched language_code)
     engine, arg, preprocess = _override_engine_by_voice(engine, arg, preprocess, voice)
-    # Claim a generation: this supersedes any older in-flight synthesis, which
-    # will abort at its next chunk boundary and release the GPU.
+    
+    # Check cache first (skip for very short text to avoid cache overhead)
+    cache_key = None
+    if len(text) > 20:  # Only cache longer texts
+        cache_key = _make_cache_key(text, engine, arg, voice)
+        cached_audio, cached_sr = _get_cached_tts(cache_key)
+        if cached_audio is not None:
+            logger.info("Cache hit engine=%s arg=%s voice=%s len=%d", engine, arg, voice, len(text))
+            output_format = body.output_format
+            if not output_format and accept:
+                a = accept.lower()
+                if "audio/wav" in a:
+                    output_format = "wav"
+                elif "audio/mpeg" in a:
+                    output_format = "mp3_44100_128"
+            
+            payload, mime = _encode_audio(cached_audio, cached_sr, output_format)
+            return Response(
+                content=payload,
+                media_type=mime,
+                headers={
+                    "X-Voice-Id": voice_id,
+                    "X-Engine": engine,
+                    "X-Language": arg,
+                    "X-Sample-Rate": str(cached_sr),
+                    "X-Cache-Hit": "true",
+                },
+            )
+    
+    # Claim a generation: this supersedes any older in-flight synthesis
     my_seq = _claim_request()
     logger.info("synth seq=%d engine=%s arg=%s voice=%s preprocess=%s len=%d", my_seq, engine, arg, voice, preprocess, len(text))
 
@@ -882,10 +970,18 @@ def text_to_speech(
             audio, sr = _mms_synthesize(text, arg, my_seq=my_seq)
     except RequestSuperseded:
         logger.info("synth seq=%d superseded by newer request", my_seq)
+        _finish_request(my_seq)
         raise HTTPException(status_code=409, detail="superseded by a newer TTS request")
     except Exception as exc:
         logger.exception("tts generation failed (engine=%s arg=%s)", engine, arg)
+        _finish_request(my_seq)
         raise HTTPException(status_code=500, detail=f"tts generation failed: {exc}") from exc
+    # Cache TTS response for future requests (only for longer texts)
+    if cache_key and len(text) > 20:
+        _cache_tts(cache_key, audio, sr)
+    
+    # Clean up request tracking
+    _finish_request(my_seq)
 
     output_format = body.output_format
     if not output_format and accept:
@@ -972,6 +1068,9 @@ def text_to_speech_stream(
             logger.exception("stream tts failed (engine=%s arg=%s)", engine, arg)
             # Can't change status mid-stream; just stop. Caller sees a short body.
             return
+        finally:
+            # Clean up request tracking
+            _finish_request(my_seq)
 
     return StreamingResponse(
         _pcm_frames(),

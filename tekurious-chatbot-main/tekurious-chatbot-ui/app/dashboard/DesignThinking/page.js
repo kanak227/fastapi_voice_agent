@@ -259,8 +259,6 @@ export default function Dashboard() {
           }
         },
         onAudioChunk: async (chunk) => {
-          if (voiceAbortRef.current) return;
-          // Play audio (normalized text) concurrently while text streams
           setVoicePhase('speaking');
           await playAudioChunk(chunk, {
             shouldAbort: () => voiceAbortRef.current,
